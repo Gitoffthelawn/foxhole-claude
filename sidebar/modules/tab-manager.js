@@ -255,18 +255,19 @@ function loadTabState(tabId, state, callbacks, elements) {
  * Items with divider:true render as visual separators.
  */
 const PRESET_PROMPTS = [
-  { icon: null, label: 'Analyze Page', prompt: "What's on this page? Give me a quick summary.", menuOnly: true },
+  { icon: null, label: 'Analyze Page', prompt: "What's on this page? Give me a quick summary of what it does, who it's for, and what I can do here." },
   { icon: null, label: 'Visual Selection', prompt: 'Let me select some items on this page visually.', menuOnly: true },
+  { icon: null, label: 'Record Workflow', prompt: 'Record a workflow for me so I can replay it automatically later. Walk me through what steps to perform.', menuOnly: true },
   { divider: true },
-  { icon: '🔍', label: 'Record API Traffic', prompt: 'Monitor network traffic as I browse this site. Summarize API endpoints, methods, and request patterns. For large payloads, just note the structure - don\'t dump raw data. I want to understand how to replicate this site\'s functionality programmatically.' },
-  { icon: '📋', label: 'Document APIs', prompt: 'Analyze the network calls captured so far. Document the internal APIs: list endpoints, auth headers, request formats, and response structures. Create a quick reference I can use to call these APIs directly.' },
-  { icon: '🗺️', label: 'Map DOM Structure', prompt: "Analyze this page's DOM structure and document the key selectors for: navigation, search, product/item listings, forms, and interactive elements. Save as site specs for future reference." },
+  { icon: '🔍', label: 'Record API Traffic', prompt: 'Monitor network traffic as I browse this site. Summarize API endpoints, methods, and request patterns. For large payloads, just note the structure — don\'t dump raw data. I want to understand how to replicate this site\'s functionality programmatically.' },
+  { icon: '📋', label: 'Document APIs', prompt: 'Analyze the network calls captured so far. Document the internal APIs: list endpoints, auth headers, request formats, and response structures. Create a quick reference I can use to call these APIs directly.', menuOnly: true },
+  { icon: '🗺️', label: 'Map DOM Structure', prompt: "Analyze this page's DOM structure and document the key selectors for: navigation, search, product/item listings, forms, and interactive elements. Save as site specs for future reference.", menuOnly: true },
   { divider: true },
   { icon: '🛡️', label: 'Security Audit', prompt: 'Audit this page for privacy and security issues. Check for: third-party trackers and analytics scripts, dark patterns (hidden opt-ins, misleading buttons, forced consent), exposed data in the DOM or network requests, insecure form actions, and suspicious external resource loading. Summarize findings by severity.' },
-  { icon: '🧲', label: 'Extract Content', prompt: "Extract content from this page. Scan the DOM to see what's here, then ask me what I want to keep (e.g., just posts, just products, just articles). Once I tell you, extract that content — clean, no ads, no clutter — and ask how I want it: view as HTML, save as markdown, or summarize in chat." },
+  { icon: '🧲', label: 'Extract Content', prompt: "Extract the main content from this page — posts, articles, or products (skip ads, nav, and sidebars). Scan the DOM, pull the primary content clean, then ask me how I want it: view as HTML, save as markdown, or summarize in chat." },
   { divider: true },
   { icon: '🔬', label: 'Dev Audit', prompt: 'Run a developer audit on this page. Detect the tech stack (frameworks, state management, UI libraries, build tools, analytics), check Core Web Vitals and performance metrics, and run a WCAG accessibility audit. Summarize all findings with actionable issues.' },
-  { icon: '🧬', label: 'Deep Recon', prompt: 'Stay in this tab. No new tabs, no navigation, no fetching endpoints. Run detect_page_tech, read get_network_requests for already-captured traffic, and inspect_app_state for live data. Top 3 per category max. Map: which DOM sections use which APIs, what state drives the UI, what\'s API-callable vs UI-only. Save a site profile and key specs.' },
+  { icon: '🧬', label: 'Deep Recon', prompt: 'Run detect_page_tech, check get_network_requests for already-captured traffic, and inspect_app_state for live data. Top 3 per category max. Map: which DOM sections call which APIs, what state drives the UI, and what\'s API-callable vs UI-only. Save a site profile and key specs.' },
 ];
 
 function escapeAttr(s) {
@@ -279,7 +280,7 @@ function escapeAttr(s) {
 function getWelcomePromptsHtml() {
   return PRESET_PROMPTS
     .filter(p => !p.divider && !p.menuOnly)
-    .map(p => `<button class="prompt-btn" data-prompt="${escapeAttr(p.prompt)}">${p.icon} ${p.label}</button>`)
+    .map(p => `<button class="prompt-btn" data-prompt="${escapeAttr(p.prompt)}">${p.icon ? p.icon + ' ' : ''}${p.label}</button>`)
     .join('\n        ');
 }
 
@@ -304,17 +305,18 @@ function getWelcomeMessageHtml() {
   return `
     <div class="welcome-message">
       <div class="welcome-icon">
-        <img src="../icons/icon-48.png" alt="Claude">
+        <img src="../icons/icon-128.png" alt="Foxhole">
       </div>
-      <h2>Welcome to Foxhole for Claude</h2>
-      <p class="welcome-intro">Browser assistant with full page control. Unlike scripts, I understand context and adapt.</p>
-      <ul class="welcome-capabilities">
-        <li><strong>Your Session</strong> - I act as you, using your logged-in cookies and auth</li>
-        <li><strong>API Discovery</strong> - Capture network traffic, I'll reverse-engineer private APIs</li>
-        <li><strong>Full DOM Access</strong> - Read, modify, and extract from page structure directly</li>
-        <li><strong>Site Memory</strong> - I learn and remember selectors, quirks, and patterns per-site</li>
-        <li><strong>Multi-step Chains</strong> - Complex workflows across pages with persistent context</li>
-      </ul>
+      <h2>Foxhole for Claude</h2>
+      <p class="welcome-tagline">Browser control with Claude's intelligence.<br>Your session. Your auth. Full access.</p>
+      <div class="welcome-caps">
+        <div class="welcome-cap"><span class="cap-icon">🔐</span><div><strong>Your Session</strong><span>Acts as you — cookies, auth, logged-in state</span></div></div>
+        <div class="welcome-cap"><span class="cap-icon">📡</span><div><strong>API Discovery</strong><span>Reverse-engineers private APIs from traffic</span></div></div>
+        <div class="welcome-cap"><span class="cap-icon">🧬</span><div><strong>Full DOM Access</strong><span>Reads, modifies, extracts page structure</span></div></div>
+        <div class="welcome-cap"><span class="cap-icon">🧠</span><div><strong>Site Memory</strong><span>Learns selectors and patterns per-site</span></div></div>
+        <div class="welcome-cap"><span class="cap-icon">⏺</span><div><strong>Workflow Recording</strong><span>Record and replay multi-step automations</span></div></div>
+        <div class="welcome-cap"><span class="cap-icon">⚡</span><div><strong>Multi-step Chains</strong><span>Complex tasks across pages, persistent context</span></div></div>
+      </div>
       <p class="welcome-tip">Try these to get started:</p>
       <div class="welcome-prompts">
         ${getWelcomePromptsHtml()}

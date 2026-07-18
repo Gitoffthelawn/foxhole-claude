@@ -207,6 +207,27 @@
     // Content type (response)
     const contentType = (request.responseContentType || '').split(';')[0].trim();
 
+    // Extract GraphQL persisted query (APQ) info from request body.
+    // Apollo sends: { operationName, variables, extensions: { persistedQuery: { sha256Hash } } }
+    // The hash changes when the site ships a new query version — capture it live, never hardcode.
+    let gqlOperation = null;
+    let apqHash = null;
+    if (request.requestBody && typeof request.requestBody === 'object') {
+      const body = request.requestBody;
+      if (body.operationName) gqlOperation = body.operationName;
+      if (body.extensions && body.extensions.persistedQuery && body.extensions.persistedQuery.sha256Hash) {
+        apqHash = body.extensions.persistedQuery.sha256Hash;
+      }
+    } else if (typeof request.requestBody === 'string') {
+      try {
+        const parsed = JSON.parse(request.requestBody);
+        if (parsed.operationName) gqlOperation = parsed.operationName;
+        if (parsed.extensions && parsed.extensions.persistedQuery) {
+          apqHash = parsed.extensions.persistedQuery.sha256Hash || null;
+        }
+      } catch (_) { /* not JSON */ }
+    }
+
     if (patterns.has(patternKey)) {
       // Merge into existing
       const existing = patterns.get(patternKey);
@@ -233,6 +254,10 @@
       if (contentType && !existing.contentType) {
         existing.contentType = contentType;
       }
+
+      // Update APQ info if discovered on this request
+      if (gqlOperation && !existing.gqlOperation) existing.gqlOperation = gqlOperation;
+      if (apqHash) existing.apqHash = apqHash; // always update — hash rotates on deploy
     } else {
       // New pattern
       patterns.set(patternKey, {
@@ -243,6 +268,8 @@
         statusCodes: request.statusCode ? [request.statusCode] : [],
         contentType: contentType || '',
         authHeaders,
+        gqlOperation: gqlOperation || null,
+        apqHash: apqHash || null,
         hitCount: 1,
         firstSeen: now,
         lastSeen: now,
@@ -394,6 +421,17 @@
     return all;
   }
 
+  // Count only patterns that qualify for the prompt (match what Claude actually sees)
+  function getQualifyingCount(domain) {
+    const patterns = domainPatterns.get(domain);
+    if (!patterns) return 0;
+    let count = 0;
+    for (const data of patterns.values()) {
+      if (data.hitCount >= CONFIG.minHitsForPrompt) count++;
+    }
+    return Math.min(count, CONFIG.maxPromptPatterns);
+  }
+
   function clearDomain(domain) {
     domainPatterns.delete(domain);
     schedulePersist();
@@ -414,6 +452,7 @@
     processCompletedRequest,
     formatForPrompt,
     getPatterns,
+    getQualifyingCount,
     clearDomain,
     clearAll,
     loadFromStorage,

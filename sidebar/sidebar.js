@@ -8,6 +8,44 @@
   'use strict';
 
   // ============================================================================
+  // DEBUG LOGGING
+  // ============================================================================
+
+  let _sidebarDebugLogging = false;
+  const _sidebarDebugBuffer = [];
+  const _SIDEBAR_DEBUG_MAX = 500;
+  const _SIDEBAR_DEBUG_PERSIST = 200;
+
+  function debugLog(level, ...args) {
+    const entry = {
+      ts: Date.now(),
+      level,
+      src: 'sidebar',
+      msg: args.map(a => (typeof a === 'object' ? JSON.stringify(a) : String(a))).join(' ')
+    };
+    if (_sidebarDebugLogging) {
+      _sidebarDebugBuffer.push(entry);
+      if (_sidebarDebugBuffer.length > _SIDEBAR_DEBUG_MAX) _sidebarDebugBuffer.shift();
+      browser.storage.local.set({ foxholeDebugLogs_sidebar: _sidebarDebugBuffer.slice(-_SIDEBAR_DEBUG_PERSIST) }).catch(() => {});
+    }
+    if (level === 'ERROR') {
+      console.error('[Sidebar]', ...args);
+    } else {
+      console.log('[Sidebar]', ...args);
+    }
+  }
+
+  browser.storage.local.get('debugLogging').then(r => {
+    _sidebarDebugLogging = r.debugLogging === true;
+  }).catch(() => {});
+
+  browser.storage.onChanged.addListener((changes, area) => {
+    if (area === 'local' && changes.debugLogging !== undefined) {
+      _sidebarDebugLogging = changes.debugLogging.newValue === true;
+    }
+  });
+
+  // ============================================================================
   // STATE
   // ============================================================================
 
@@ -40,6 +78,7 @@
 
   /** @type {string[]} Tools that require confirmation in 'ask' mode */
   let configuredHighRiskTools = ['click_element', 'type_text', 'navigate', 'execute_script', 'fill_form', 'press_key'];
+  let passiveObserverEnabled = false;
 
   /** @type {Array} Pending images to send with next message */
   let pendingImages = [];
@@ -79,6 +118,11 @@
   const autonomyLabel = document.getElementById('autonomy-label');
   const autonomyOptions = document.querySelectorAll('.autonomy-option');
   const screenshotBtn = document.getElementById('screenshot-btn');
+  const regionScreenshotBtn = document.getElementById('region-screenshot-btn');
+  const recordBtn = document.getElementById('record-btn');
+  const recordingIndicator = document.getElementById('recording-indicator');
+  const recordingStepCount = document.getElementById('recording-step-count');
+  let isRecording = false;
   const imagePreviewContainer = document.getElementById('image-preview-container');
   // imagePreview and removeImageBtn are now created dynamically per-image in renderImagePreviews()
   const settingsMenuBtn = document.getElementById('settings-menu-btn');
@@ -232,6 +276,29 @@
 
     // Save state when sidebar is closed
     window.addEventListener('pagehide', () => { persistSidebarState(); });
+
+    // Keep a live port to the background. In Firefox this disconnects only on true
+    // extension reload. In Chrome MV3 the service worker also dies after ~30s idle,
+    // which closes the port — so we reconnect silently instead of reloading the page.
+    // Only do a hard reload if runtime.connect itself throws (context truly invalidated).
+    let _bgReconnectTimer = null;
+    function connectBackgroundPort() {
+      let port;
+      try {
+        port = browser.runtime.connect({ name: 'sidebar' });
+      } catch (e) {
+        // Extension was reloaded / unloaded — full reload required
+        window.location.reload();
+        return;
+      }
+      port.onDisconnect.addListener(() => {
+        persistSidebarState();
+        if (_bgReconnectTimer) clearTimeout(_bgReconnectTimer);
+        // Give the SW 500ms to wake back up before reconnecting
+        _bgReconnectTimer = setTimeout(connectBackgroundPort, 500);
+      });
+    }
+    connectBackgroundPort();
   }
 
   // ============================================================================
@@ -256,6 +323,7 @@
       if (tab) {
         currentTabId = tab.id;
         currentWindowId = tab.windowId;
+        browser.runtime.sendMessage({ type: 'SIDEBAR_TAB_OPENED', tabId: tab.id }).catch(() => {});
         if (!tabConversations.has(currentTabId)) {
           tabConversations.set(currentTabId, {
             conversation: [],
@@ -266,7 +334,7 @@
           });
         }
         loadTabState(currentTabId);
-        console.log(`[Sidebar] Initialized for window ${currentWindowId}, tab ${currentTabId}`);
+        debugLog('INFO', `[Sidebar] Initialized for window ${currentWindowId}, tab ${currentTabId}`);
         updateTabInfo();
         updateApiIndicator();
       }
@@ -291,17 +359,18 @@
     if (newTabId === currentTabId) return;
 
     if (isStreaming && pendingTabSwitch === newTabId) {
-      console.log('[TabSwitch] Ignoring activation of pending tab during streaming');
+      debugLog('INFO', '[TabSwitch] Ignoring activation of pending tab during streaming');
       return;
     }
 
     if (isStreaming) {
-      console.log('[TabSwitch] Ignoring tab switch during streaming');
+      debugLog('INFO', '[TabSwitch] Ignoring tab switch during streaming');
       return;
     }
 
     saveCurrentTabState();
     currentTabId = newTabId;
+    browser.runtime.sendMessage({ type: 'SIDEBAR_TAB_OPENED', tabId: newTabId }).catch(() => {});
     loadTabState(newTabId);
     specsManager?.updateBadge();
     updateTabInfo();
@@ -310,7 +379,7 @@
 
   function handleTabRemoved(tabId, _removeInfo) {
     tabConversations.delete(tabId);
-    console.log(`[TabSwitch] Cleaned up conversation for tab ${tabId}`);
+    debugLog('INFO', `[TabSwitch] Cleaned up conversation for tab ${tabId}`);
   }
 
   function saveCurrentTabState() {
@@ -359,7 +428,7 @@
     const savedState = tabConversations.get(tabId);
 
     if (isStreaming && streamingTabId !== tabId) {
-      console.log('[LoadTabState] Resetting stuck streaming state');
+      debugLog('INFO', '[LoadTabState] Resetting stuck streaming state');
       resetStreamingState();
     }
 
@@ -375,6 +444,9 @@
       if (savedState.chatHtml) {
         chatContainer.innerHTML = savedState.chatHtml;
         reattachChatEventListeners();
+        if (chatContainer.querySelector('.welcome-message')) {
+          window.TabManager.attachPromptButtonListeners(userInput);
+        }
         // Restore scroll position after DOM update
         if (savedState.scrollTop !== undefined) {
           requestAnimationFrame(() => {
@@ -418,7 +490,7 @@
 
   async function loadSettings() {
     try {
-      const result = await browser.storage.local.get(['autonomyMode', 'defaultModel', 'highRiskTools']);
+      const result = await browser.storage.local.get(['autonomyMode', 'defaultModel', 'highRiskTools', 'passiveObserver']);
 
       if (result.autonomyMode) {
         autonomyMode = result.autonomyMode;
@@ -426,13 +498,24 @@
       }
 
       if (result.defaultModel) {
-        selectedModel = result.defaultModel;
+        // Migrate old model IDs to current equivalents
+        const modelMigrations = {
+          'claude-haiku-4-5': 'claude-haiku-4-5-20251001',
+          'claude-sonnet-4-5': 'claude-sonnet-4-6',
+          'claude-opus-4-5': 'claude-opus-4-8',
+        };
+        selectedModel = modelMigrations[result.defaultModel] || result.defaultModel;
+        if (modelMigrations[result.defaultModel]) {
+          browser.storage.local.set({ defaultModel: selectedModel }).catch(() => {});
+        }
         modelSelect.value = selectedModel;
       }
 
       if (result.highRiskTools) {
         configuredHighRiskTools = result.highRiskTools;
       }
+
+      passiveObserverEnabled = result.passiveObserver === true;
     } catch (error) {
       console.error('Failed to load settings:', error);
     }
@@ -442,20 +525,24 @@
       if (changes.highRiskTools) {
         configuredHighRiskTools = changes.highRiskTools.newValue;
       }
+      if (changes.passiveObserver) {
+        passiveObserverEnabled = changes.passiveObserver.newValue === true;
+        updateApiIndicator();
+      }
     });
   }
 
   async function checkApiKey() {
     try {
       const result = await browser.storage.local.get(['apiKey', 'apiKeyStatus']);
-      console.log('[Sidebar] API key check:', {
+      debugLog('INFO', '[Sidebar] API key check:', {
         hasKey: !!result.apiKey,
         keyLength: result.apiKey?.length || 0,
         status: result.apiKeyStatus
       });
       apiKeyConfigured = !!result.apiKey;
       if (!apiKeyConfigured) {
-        console.log('[Sidebar] No API key found, showing modal');
+        debugLog('INFO', '[Sidebar] No API key found, showing modal');
         window.ModalManager.apiKey.show();
       }
     } catch (error) {
@@ -480,6 +567,46 @@
     clearChatBtn.addEventListener('click', window.ModalManager.clearChat.show);
     clearConfirmCancel.addEventListener('click', window.ModalManager.clearChat.hide);
     clearConfirmApprove.addEventListener('click', window.ModalManager.clearChat.handleConfirm);
+
+    // Token display — click for popover breakdown
+    const tokenDisplay = document.getElementById('token-display');
+    const tokenPopover = document.getElementById('token-popover');
+    if (tokenDisplay && tokenPopover) {
+      tokenDisplay.addEventListener('click', (e) => {
+        e.stopPropagation();
+        const isVisible = !tokenPopover.classList.contains('hidden');
+        if (isVisible) { tokenPopover.classList.add('hidden'); return; }
+
+        function fmt(n) { return n > 0 ? `${(n/1000).toFixed(1)}k` : '0'; }
+        document.getElementById('tp-total').textContent =
+          `${fmt(_tpData.inTotal)} in / ${fmt(_tpData.outTotal)} out = ${fmt(_tpData.total)} total`;
+        document.getElementById('tp-last').textContent =
+          `${fmt(_tpData.lastTurn)} tokens`;
+        const cacheRow = document.getElementById('tp-cache-row');
+        if (_tpData.cacheRead > 0 || _tpData.cacheCreation > 0) {
+          document.getElementById('tp-cache').textContent =
+            `${fmt(_tpData.cacheRead)} read / ${fmt(_tpData.cacheCreation)} written`;
+          cacheRow.style.display = '';
+        } else {
+          cacheRow.style.display = 'none';
+        }
+        tokenPopover.classList.remove('hidden');
+      });
+
+      document.addEventListener('click', () => tokenPopover.classList.add('hidden'));
+
+      document.getElementById('tp-compress')?.addEventListener('click', () => {
+        tokenPopover.classList.add('hidden');
+        userInput.value = 'Compress context';
+        handleInputChange();
+        handleSendMessage();
+      });
+
+      document.getElementById('tp-clear')?.addEventListener('click', () => {
+        tokenPopover.classList.add('hidden');
+        window.ModalManager.clearChat.show();
+      });
+    }
 
     // Menu toggle
     menuBtn.addEventListener('click', window.ModalManager.autonomy.toggleDropdown);
@@ -511,6 +638,54 @@
         screenshotBtn.disabled = false;
       }
     });
+    // Region screenshot button - lets user drag to select a page region
+    if (regionScreenshotBtn) {
+      regionScreenshotBtn.addEventListener('click', async () => {
+        try {
+          regionScreenshotBtn.disabled = true;
+          const result = await browser.runtime.sendMessage({ type: 'TAKE_REGION_SCREENSHOT' });
+          if (result?.screenshot) {
+            const match = result.screenshot.match(/^data:(image\/\w+);base64,(.+)$/);
+            if (match) {
+              pendingImages.push({ mediaType: match[1], base64: match[2] });
+              renderImagePreviews();
+              handleInputChange();
+              userInput.focus();
+            }
+          }
+        } catch (err) {
+          console.error('Region screenshot failed:', err);
+        } finally {
+          regionScreenshotBtn.disabled = false;
+        }
+      });
+    }
+
+    // Record button - toggles workflow recording mode
+    if (recordBtn) {
+      recordBtn.addEventListener('click', () => {
+        if (!isRecording) {
+          isRecording = true;
+          recordBtn.classList.add('recording');
+          recordBtn.title = 'Stop recording';
+          recordingIndicator?.classList.remove('hidden');
+          if (recordingStepCount) recordingStepCount.textContent = '0 steps';
+          // Inject message into chat to trigger Claude's start_recording tool call
+          userInput.value = 'Start recording a workflow for me so I can replay it later.';
+          handleInputChange();
+          handleSendMessage();
+        } else {
+          isRecording = false;
+          recordBtn.classList.remove('recording');
+          recordBtn.title = 'Record workflow';
+          recordingIndicator?.classList.add('hidden');
+          userInput.value = 'Stop recording and save the workflow with a descriptive name.';
+          handleInputChange();
+          handleSendMessage();
+        }
+      });
+    }
+
     // Remove buttons are now per-image, created dynamically in renderImagePreviews()
     userInput.addEventListener('paste', window.ModalManager.attach.handlePaste);
 
@@ -526,6 +701,71 @@
       exportContext();
     });
 
+    // Workflows panel
+    const workflowsMenuBtn = document.getElementById('workflows-menu-btn');
+    const workflowsModal = document.getElementById('workflows-modal');
+    const workflowsClose = document.getElementById('workflows-close');
+    const workflowsList = document.getElementById('workflows-list');
+    const workflowsEmpty = document.getElementById('workflows-empty');
+
+    function renderWorkflows(workflows) {
+      // Remove existing items (keep the empty state div)
+      Array.from(workflowsList.children).forEach(el => {
+        if (el !== workflowsEmpty) el.remove();
+      });
+      if (!workflows || workflows.length === 0) {
+        workflowsEmpty.classList.remove('hidden');
+        return;
+      }
+      workflowsEmpty.classList.add('hidden');
+      workflows
+        .slice()
+        .sort((a, b) => b.created - a.created)
+        .forEach(wf => {
+          const item = document.createElement('div');
+          item.className = 'workflow-item';
+          item.innerHTML = `
+            <div class="workflow-item-info">
+              <div class="workflow-item-name">${wf.name}</div>
+              ${wf.description ? `<div class="workflow-item-desc">${wf.description}</div>` : ''}
+              <div class="workflow-item-meta">${wf.steps.length} step${wf.steps.length !== 1 ? 's' : ''} · run ${wf.runCount || 0}×</div>
+            </div>
+            <div class="workflow-item-actions">
+              <button class="workflow-run-btn" data-name="${wf.name}" title="Run workflow">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><polygon points="5,3 19,12 5,21"/></svg>
+              </button>
+              <button class="workflow-delete-btn" data-name="${wf.name}" title="Delete workflow">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                  <polyline points="3,6 5,6 21,6"/><path d="M19,6v14a2 2 0 01-2 2H7a2 2 0 01-2-2V6m3,0V4a2 2 0 012-2h4a2 2 0 012,2v2"/>
+                </svg>
+              </button>
+            </div>
+          `;
+          item.querySelector('.workflow-run-btn').addEventListener('click', () => {
+            workflowsModal.classList.add('hidden');
+            userInput.value = `Run the workflow named "${wf.name}"`;
+            handleInputChange();
+            handleSendMessage();
+          });
+          item.querySelector('.workflow-delete-btn').addEventListener('click', async () => {
+            if (!confirm(`Delete workflow "${wf.name}"?`)) return;
+            const resp = await browser.runtime.sendMessage({ type: 'DELETE_WORKFLOW', name: wf.name });
+            renderWorkflows(resp.workflows);
+          });
+          workflowsList.appendChild(item);
+        });
+    }
+
+    workflowsMenuBtn?.addEventListener('click', async () => {
+      dropdownMenu.classList.add('hidden');
+      workflowsModal.classList.remove('hidden');
+      const resp = await browser.runtime.sendMessage({ type: 'GET_WORKFLOWS' });
+      renderWorkflows(resp.workflows);
+    });
+
+    workflowsClose?.addEventListener('click', () => workflowsModal.classList.add('hidden'));
+    workflowsModal?.querySelector('.modal-backdrop')?.addEventListener('click', () => workflowsModal.classList.add('hidden'));
+
     // Report prompt button
     reportPromptBtn.addEventListener('click', () => {
       userInput.value = 'Generate report based on your findings';
@@ -539,6 +779,15 @@
 
     // Stop button
     stopBtn.addEventListener('click', handleStopGeneration);
+
+    // Choice buttons (rendered by stream-renderer when Claude outputs <choices>)
+    document.addEventListener('foxhole-choice-selected', (e) => {
+      const text = e.detail?.text;
+      if (text && !isStreaming) {
+        userInput.value = text;
+        handleSubmit();
+      }
+    });
 
     // Confirmation modal
     confirmCancel.addEventListener('click', window.ModalManager.confirm.cancel);
@@ -654,7 +903,10 @@
     const hasText = userInput.value.trim().length > 0;
     const hasImages = pendingImages.length > 0;
     sendBtn.disabled = (!hasText && !hasImages) || isStreaming;
-    if (userInput.value.length > 0) reportPromptBtn.classList.add('hidden');
+    if (userInput.value.length > 0) {
+      reportPromptBtn.classList.add('hidden');
+      chatContainer.classList.remove('awaiting-reply');
+    }
   }
 
   async function handleSendMessage() {
@@ -749,6 +1001,7 @@
     streamingTabId = null;
     pendingTabSwitch = null;
     stopThinkingTimer();
+    clearToolGeneratingIndicator();
     sendBtn.classList.remove('hidden');
     stopBtn.classList.add('hidden');
     sendBtn.disabled = userInput.value.trim().length === 0;
@@ -783,12 +1036,50 @@
     thinkingTimer = null;
   }
 
+  let _toolGeneratingName = null;
+  let _toolInputCharCount = 0;
+
+  function handleToolUseStart(toolName) {
+    _toolGeneratingName = toolName;
+    _toolInputCharCount = 0;
+    stopThinkingTimer();
+    updateToolGeneratingIndicator();
+  }
+
+  function handleToolInputDelta(partialJson) {
+    if (!_toolGeneratingName) return;
+    _toolInputCharCount += (partialJson || '').length;
+    // Update every ~500 chars to avoid DOM thrash
+    if (_toolInputCharCount % 500 < 50) {
+      updateToolGeneratingIndicator();
+    }
+  }
+
+  function updateToolGeneratingIndicator() {
+    const cursor = chatContainer.querySelector('.streaming-cursor');
+    if (!cursor) return;
+    let indicator = cursor.parentNode.querySelector('.tool-generating-indicator');
+    if (!indicator) {
+      indicator = document.createElement('span');
+      indicator.className = 'tool-generating-indicator';
+      cursor.parentNode.insertBefore(indicator, cursor.nextSibling);
+    }
+    const kb = (_toolInputCharCount / 1024).toFixed(1);
+    indicator.textContent = `Generating ${_toolGeneratingName}… ${_toolInputCharCount > 0 ? `(${kb} KB)` : ''}`;
+  }
+
+  function clearToolGeneratingIndicator() {
+    _toolGeneratingName = null;
+    _toolInputCharCount = 0;
+    const el = chatContainer.querySelector('.tool-generating-indicator');
+    if (el) el.remove();
+  }
+
   async function handleStopGeneration() {
     try {
-      const [tab] = await browser.tabs.query({ active: true, currentWindow: true });
       await browser.runtime.sendMessage({
         type: 'CANCEL_STREAM',
-        tabId: tab.id
+        tabId: streamingTabId ?? currentTabId
       });
       resetStreamingState();
 
@@ -811,12 +1102,21 @@
     }
 
     if (message.type !== 'STREAM_DELTA') {
-      console.log('[Sidebar] Received message:', message.type, message);
+      debugLog('INFO', '[Sidebar] Received message:', message.type, message);
     }
 
     switch (message.type) {
       case 'STREAM_DELTA':
         handleStreamDelta(message.text);
+        break;
+      case 'STREAM_TOOL_USE_START':
+        handleToolUseStart(message.toolName);
+        break;
+      case 'STREAM_TOOL_INPUT_DELTA':
+        handleToolInputDelta(message.partialJson);
+        break;
+      case 'STREAM_BLOCK_STOP':
+        clearToolGeneratingIndicator();
         break;
       case 'STREAM_TOOL_USE':
         handleToolUse({
@@ -846,6 +1146,11 @@
       case 'TAB_CREATED_BY_TOOL':
         handleTabCreatedByTool(message);
         break;
+      case 'RECORDING_STEP_COUNT':
+        if (recordingStepCount) {
+          recordingStepCount.textContent = `${message.count} step${message.count !== 1 ? 's' : ''}`;
+        }
+        break;
     }
   }
 
@@ -853,7 +1158,7 @@
     if (message.tabId && message.tabId !== currentTabId) {
       if (isStreaming) {
         pendingTabSwitch = message.tabId;
-        console.log('[TabSwitch] Deferring switch to tab', message.tabId, 'until streaming completes');
+        debugLog('INFO', '[TabSwitch] Deferring switch to tab', message.tabId, 'until streaming completes');
       } else {
         saveCurrentTabState();
         currentTabId = message.tabId;
@@ -999,8 +1304,13 @@
       return;
     }
 
-    const msgElement = chatContainer.querySelector('.message.assistant:last-child');
-    if (!msgElement) return;
+    // Use last assistant message, not :last-child — ephemeral/system messages may follow it
+    const allAssistantMsgs = chatContainer.querySelectorAll('.message.assistant');
+    const msgElement = allAssistantMsgs[allAssistantMsgs.length - 1] || null;
+    if (!msgElement) {
+      resetStreamingState();
+      return;
+    }
 
     const contentElement = msgElement.querySelector('.message-content');
 
@@ -1024,6 +1334,7 @@
       await processLearnedExperiences(finalText);
       finalText = stripLearnedBlocks(finalText);
       finalText = stripSpecBlocks(finalText);
+      finalText = stripChoiceBlocks(finalText);
 
       const complexityScore = parseComplexityScore(finalText);
       finalText = stripComplexityScore(finalText);
@@ -1065,6 +1376,11 @@
 
     window.RenderUtils.forceScrollToBottom(chatContainer);
 
+    // Show "your turn" nudge if Claude's response ends with a question
+    if (finalText && finalText.trimEnd().endsWith('?')) {
+      chatContainer.classList.add('awaiting-reply');
+    }
+
     // Handle pending tab switch
     const tabToSwitchTo = pendingTabSwitch;
     const activityItems = activityLog?.querySelectorAll('.activity-item');
@@ -1078,7 +1394,7 @@
     }
 
     if (tabToSwitchTo && tabToSwitchTo !== currentTabId) {
-      console.log('[TabSwitch] Streaming complete, switching to pending tab', tabToSwitchTo);
+      debugLog('INFO', '[TabSwitch] Streaming complete, switching to pending tab', tabToSwitchTo);
       saveCurrentTabState();
       currentTabId = tabToSwitchTo;
       loadTabState(tabToSwitchTo);
@@ -1101,7 +1417,7 @@
     const check = window.ContextManager.checkCompressionNeeded(totalTokens, conversation);
 
     if (check.needsCompression) {
-      console.log(`[ContextManager] Compression triggered: ${check.reason}`);
+      debugLog('INFO', `[ContextManager] Compression triggered: ${check.reason}`);
 
       // Save current state BEFORE compression as backup
       const backupConversation = [...conversation];
@@ -1134,12 +1450,12 @@
         saveCurrentTabState();
 
         showSystemMessage(`Context compressed (~${Math.round(estimatedTokens/1000)}k tokens estimated)`);
-        console.log('[ContextManager] Compression complete');
+        debugLog('INFO', '[ContextManager] Compression complete');
       } catch (error) {
         console.error('[ContextManager] Compression failed:', error);
         // Restore backup if chat was somehow lost
         if (!chatContainer.innerHTML || chatContainer.innerHTML.includes('welcome-message')) {
-          console.log('[ContextManager] Restoring chat UI from backup');
+          debugLog('INFO', '[ContextManager] Restoring chat UI from backup');
           chatContainer.innerHTML = backupChatHtml;
           conversation = backupConversation;
         } else {
@@ -1301,6 +1617,9 @@
   // TOKEN DISPLAY
   // ============================================================================
 
+  // Live token data for the popover — updated on every render
+  let _tpData = { total: 0, lastTurn: 0, cacheRead: 0, cacheCreation: 0, inTotal: 0, outTotal: 0 };
+
   /**
    * Refreshes the token display based on current tokenUsage and lastTurnTokens values.
    * Use this when restoring state (tab switch, clear) - no accumulation.
@@ -1352,6 +1671,16 @@
       if (cacheCreation > 0) tooltipLines.push(`Cache write: ${cacheCreation.toLocaleString()} tokens`);
     }
     tokenDisplay.title = tooltipLines.join('\n');
+
+    // Keep popover data current so it's ready when clicked
+    _tpData = {
+      total: cumulativeTotal,
+      inTotal: cumulativeInput,
+      outTotal: cumulativeOutput,
+      lastTurn: lastTurnTotal,
+      cacheRead,
+      cacheCreation,
+    };
   }
 
   /**
@@ -1417,10 +1746,22 @@
     const countEl = document.getElementById('api-indicator-count');
     if (!indicator || !countEl) return;
 
+    // Always visible — show disabled state when observer is off
+    indicator.classList.remove('hidden');
+
+    if (!passiveObserverEnabled) {
+      indicator.dataset.state = 'disabled';
+      countEl.textContent = 'off';
+      indicator.title = 'Passive Observer is disabled — enable in Settings';
+      return;
+    }
+
     try {
       const [tab] = await browser.tabs.query({ active: true, currentWindow: true });
       if (!tab?.url) {
-        indicator.classList.add('hidden');
+        indicator.dataset.state = 'empty';
+        countEl.textContent = '0';
+        indicator.title = 'Passive Observer active';
         return;
       }
 
@@ -1428,7 +1769,9 @@
       try {
         domain = new URL(tab.url).hostname.replace(/^www\./, '');
       } catch {
-        indicator.classList.add('hidden');
+        indicator.dataset.state = 'empty';
+        countEl.textContent = '0';
+        indicator.title = 'Passive Observer active';
         return;
       }
 
@@ -1437,32 +1780,37 @@
       const domCount = counts?.dom || 0;
       const totalCount = apiCount + domCount;
 
+      countEl.textContent = totalCount;
+
       if (totalCount > 0) {
-        countEl.textContent = totalCount;
+        indicator.dataset.state = 'active';
         const parts = [];
         if (apiCount > 0) parts.push(`${apiCount} API endpoint${apiCount !== 1 ? 's' : ''}`);
         if (domCount > 0) parts.push(`${domCount} DOM pattern${domCount !== 1 ? 's' : ''}`);
         indicator.title = `${parts.join(', ')} observed on ${domain}`;
-        indicator.classList.remove('hidden');
-        indicator.classList.add('has-patterns');
       } else {
-        indicator.classList.add('hidden');
-        indicator.classList.remove('has-patterns');
+        indicator.dataset.state = 'empty';
+        indicator.title = `Passive Observer active — watching ${domain}`;
       }
     } catch (e) {
-      indicator.classList.add('hidden');
+      indicator.dataset.state = 'empty';
+      countEl.textContent = '0';
     }
   }
 
   // Refresh indicator periodically so count updates while browsing
   setInterval(updateApiIndicator, 10000);
 
-  // Click indicator to paste a prompt querying captured data
+  // Click indicator: open settings when disabled, paste query prompt when active
   const apiIndicator = document.getElementById('api-indicator');
   if (apiIndicator) {
     apiIndicator.style.cursor = 'pointer';
     apiIndicator.addEventListener('click', () => {
-      const prompt = 'List all observed API endpoints and DOM patterns for this site with full paths and hit counts.';
+      if (!passiveObserverEnabled) {
+        browser.runtime.openOptionsPage();
+        return;
+      }
+      const prompt = 'From the passive observer data already in your system context (do not use any tools), list all API endpoints and DOM patterns recorded for this site, with full paths and hit counts.';
       userInput.value = prompt;
       userInput.style.height = 'auto';
       userInput.style.height = Math.min(userInput.scrollHeight, 120) + 'px';
@@ -1494,7 +1842,7 @@
         });
 
         if (result?.success) {
-          console.log(`[Experiences] Saved: "${exp.issue}" for ${domain}`);
+          debugLog('INFO', `[Experiences] Saved: "${exp.issue}" for ${domain}`);
         }
       } catch (error) {
         console.error('[Experiences] Failed to save:', error);
@@ -1549,6 +1897,10 @@
 
   function stripSpecBlocks(text) {
     return text.replace(/<!--SPEC\s*[\s\S]*?-->\s*/g, '');
+  }
+
+  function stripChoiceBlocks(text) {
+    return text.replace(/<choices>[\s\S]*?<\/choices>\s*/g, '');
   }
 
   // ============================================================================

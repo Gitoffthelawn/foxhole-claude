@@ -25,7 +25,7 @@ Firefox WebExtension (Manifest V2) with four layers:
 | `background/prompt-loader.js` | Loads and caches system prompt from `.txt` file |
 | `background/api-observer.js` | Passive network request observer — records API patterns per domain |
 | `background/interaction-observer.js` | Passive DOM interaction observer — records working selectors per domain |
-| `sidebar/sidebar.js` | Main sidebar logic, token tracking, event wiring |
+| `sidebar/sidebar.js` | Main sidebar logic, token tracking, event wiring, model migration |
 | `sidebar/modules/stream-renderer.js` | Streaming display, message finalization (response text above activity log) |
 | `sidebar/modules/activity-log.js` | Collapsible tool call display, HTML conversion button |
 | `sidebar/modules/modal-manager.js` | All modals (confirmation, API key, shortcuts) |
@@ -40,6 +40,34 @@ The extension is a browser **assistant** — Claude helps the user interact with
 - **First-visit discovery** — on new sites, probe DOM for framework + check API observer before guessing
 
 This philosophy is enforced in `system-prompt.txt` rules 5 and 6.
+
+## Element Registry (tref_N handles)
+
+`content.js` maintains a WeakRef-based element registry (module-level `_foxRefMap` / `_foxReverseMap`). Any element registered gets a stable `tref_N` string handle that survives SPA re-renders for the current page session.
+
+- `registerElement(el)` — idempotent; returns existing handle if already registered
+- `findElement(selector)` — accepts both CSS selectors and `tref_N` handles; used by every interaction tool
+- `get_accessibility_tree` and `find_elements` register and return `tref_N` handles so callers can pass them directly to `click_element`, `type_text`, etc.
+
+## Tool Inventory
+
+Tools live in `background/tools.js` (definitions) and are dispatched in `background/tool-router.js`. Content-script tools are routed via `sendToContentScript`.
+
+**Element interaction:** `click_element`, `type_text`, `hover_element`, `focus_element`, `press_key`, `select_option`, `set_checkbox`, `upload_file` — all accept `tref_N` handles or CSS selectors
+
+**Discovery:** `get_accessibility_tree` (cheapest, use first), `find_elements` (natural language), `execute_script`, `get_page_content`, `dom_stats`, `detect_page_tech`
+
+**Navigation:** `navigate`, `scroll_to`, `wait_for_element`, `go_back`, `go_forward`, `reload_page`
+
+**Data:** `fetch_url` (background, no auth), `fetch_with_session` (in-page, carries auth cookies), `get_network_requests`, `clear_network_requests`
+
+**Page modification:** `inject_css`, `toggle_selection_mode`, `get_user_selections`
+
+**Capture:** `take_screenshot`, `take_region_screenshot`, `get_performance_metrics`, `audit_accessibility`
+
+**Dialogs:** `handle_dialog` — intercepts alert/confirm/prompt before they block; `drain` mode retrieves post-hoc
+
+**Site knowledge:** `save_site_spec`, `delete_site_spec`
 
 ## Site Knowledge System
 
@@ -67,6 +95,10 @@ Each spec shows its `spec_id` as a `#xxxx` suffix at the end of the spec heading
 ### Profile rendering
 
 Profile specs render first, above all other specs, in a box-drawing border with no code fence (raw text for readability).
+
+## Site Manipulation Playbook
+
+`docs/site-manipulation-playbook.md` — engineering techniques for reading and driving modern SPA/GraphQL sites when DOM scraping fails or goes stale: reading React fiber state (`wrappedJSObject` in FF, MAIN world in Chrome), client-side-nav-fires-no-network staleness, response-body capture (`filterResponseData` vs fetch/XHR monkey-patch), persisted-query/CSRF API replay, stall-guarded pagination, and clipboard reliability. Read it before touching `content/content.js`, the observers, or the Chrome port.
 
 ## Prompt Injection Defense
 
@@ -151,11 +183,28 @@ Extension is submitted to addons.mozilla.org from `master` branch.
 - Spec content is backtick-escaped (`\u200B`) at save time to prevent code fence breakout in prompt formatting
 - Visual Selection tracks selected elements in a JS `Set` (source of truth) + `MutationObserver` to re-apply `data-user-selected` when SPAs (React/Vue) wipe DOM attributes on re-render
 - `STREAM_DELTA` messages are excluded from the sidebar console log (fires per streaming token — too noisy); all other message types still log
+- "Your turn" nudge — `chatContainer` gets class `awaiting-reply` when Claude's final response ends with `?`; CSS `::after` shows a pulsing "↩ your turn" indicator; class removed on first keystroke
+- Model migration runs in `sidebar.js:loadSettings()` — old model IDs without date suffixes (e.g. `claude-haiku-4-5`) are silently remapped to canonical IDs and persisted
+- Debug logs use per-context storage keys: `foxholeDebugLogs_bg`, `foxholeDebugLogs_sidebar`, `foxholeDebugLogs_content` — options page merges and sorts all three by timestamp
+- Stop button cancels using `streamingTabId` (the tab that started the stream), not the currently active tab — these differ when the user switches tabs mid-stream
+
+## CRITICAL: browser-polyfill.min.js
+
+**NEVER add `browser-polyfill.min.js` to `sidebar/sidebar.html`.** Firefox has native `browser.*` support, but the polyfill's UMD wrapper unconditionally overwrites `globalThis.browser` with `{}` even on Firefox — every `browser.*` call then throws and no buttons work.
+
+The polyfill is only loaded in:
+- `background/service-worker.js` via `importScripts` (Chrome only)
+- Content scripts via `manifest.chrome.json` injection (Chrome only)
+
+For the Chrome port, the sidebar uses a conditional init script (`sidebar-init.js`) that detects `typeof browser === 'undefined'` before loading the polyfill.
+
+## Chrome Port
+
+Instructions for porting to Chrome MV3 live at:
+`/Users/makram/dev/chrome-extensions/foxhole-for-claude/CLAUDE.md`
+
+Key points: no code changes needed to shared files; Chrome port uses `manifest.chrome.json` + `background/service-worker.js` + a build script that copies the repo and swaps the manifest. The sidebar polyfill conditional-load pattern is the main Chrome-specific addition needed in sidebar HTML.
 
 ## Testing
 
 No automated tests. Manual testing in Firefox via `about:debugging` > Load Temporary Add-on.
-
-## Pending
-
-- **Debug logging flag** — add `debugLogging` toggle to options page; replace `console.log` with `debugLog()` helper in `sidebar/sidebar.js`, `background/background.js`, and `content/content.js`; sync at runtime via `browser.storage.onChanged`; `console.error` stays unconditional

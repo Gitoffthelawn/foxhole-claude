@@ -2,28 +2,94 @@
  * Foxhole for Claude - Background Script
  * Main coordinator for Claude API, tool execution, and sidebar communication
  */
+/* global ClaudeAPI, InteractionObserver, ApiObserver, SiteKnowledge, ContentSanitizer, BROWSER_TOOLS, getToolByName, isHighRiskTool, executeTool, addToConsoleBuffer, addToErrorBuffer, addToWebsocketBuffer, getNetworkRequests, clearAllNetworkRequests, getCustomRequestHeaders, getBlockedUrlPatterns, passiveObserverEnabled */
 
 (function() {
   'use strict';
+
+  // Debug logging
+  let debugLogging = false;
+  const _debugLogBuffer = [];
+  const _DEBUG_MAX_BUFFER = 500;
+  const _DEBUG_PERSIST_COUNT = 200;
+
+  function debugLog(level, ...args) {
+    const entry = {
+      ts: Date.now(),
+      level,
+      msg: args.map(a => (typeof a === 'object' ? JSON.stringify(a) : String(a))).join(' ')
+    };
+    if (debugLogging) {
+      _debugLogBuffer.push(entry);
+      if (_debugLogBuffer.length > _DEBUG_MAX_BUFFER) _debugLogBuffer.shift();
+      browser.storage.local.set({ foxholeDebugLogs_bg: _debugLogBuffer.slice(-_DEBUG_PERSIST_COUNT) }).catch(() => {});
+    }
+    if (level === 'ERROR') {
+      console.error('[BG]', ...args);
+    } else {
+      console.log('[BG]', ...args);
+    }
+  }
+
+  // Load debugLogging preference
+  browser.storage.local.get('debugLogging').then(r => {
+    debugLogging = r.debugLogging === true;
+  }).catch(() => {});
+
+  browser.storage.onChanged.addListener((changes, area) => {
+    if (area === 'local' && changes.debugLogging !== undefined) {
+      debugLogging = changes.debugLogging.newValue === true;
+    }
+  });
 
   // State
   let claudeApi = null;
   let defaultAutonomyMode = 'ask'; // Global default for new tabs
   const tabAutonomyModes = new Map(); // tabId -> autonomyMode (per-tab setting)
+  const sidebarTabs = new Set();      // tabIds that have used the sidebar (API observer scope)
 
   // Get autonomy mode for a specific tab (falls back to default)
   function getAutonomyMode(tabId) {
     return tabAutonomyModes.get(tabId) || defaultAutonomyMode;
   }
+
+  // Persist key SW state so it survives Chrome MV3 service worker termination.
+  // browser.storage.session is available in FF 102+ too; in Firefox the bg page never
+  // terminates so the restore below is a harmless no-op.
+  function persistSwState() {
+    browser.storage.session.set({
+      swTabAutonomyModes: Object.fromEntries(tabAutonomyModes),
+    }).catch(() => {});
+  }
+
+  // Restore persisted SW state (runs once at startup)
+  browser.storage.session.get('swTabAutonomyModes').then(data => {
+    if (data.swTabAutonomyModes) {
+      for (const [k, v] of Object.entries(data.swTabAutonomyModes)) {
+        tabAutonomyModes.set(Number(k), v);
+      }
+    }
+  }).catch(() => {});
   let configuredMaxToolIterations = 15; // User's configured setting (from storage)
   let currentTaskMaxIterations = 15; // Effective limit for current task (may be increased by user during task)
   let currentTaskToolCallCount = 0; // Actual tool call count for current task
+  let currentTaskScreenshotCount = 0; // Screenshots taken this task — hard capped
   const HARD_TOOL_CALL_CAP = 200; // Absolute maximum tool calls even in "unlimited" mode
+  const SCREENSHOT_CAP = 5; // Max screenshots per task — beyond this is always a loop
   let recentToolCalls = []; // Loop detection: { name, summary }
   let configuredHighRiskTools = ['click_element', 'type_text', 'navigate', 'execute_script', 'fill_form', 'press_key']; // Default high-risk tools
   let debugMode = false; // Log full API requests when enabled
   let pendingToolConfirmations = new Map();
+
+  // Workflow recording state — survives content script reloads (content script sends steps here)
+  let workflowRecording = {
+    active: false,
+    tabId: null,
+    steps: [],
+    lastUrl: null
+  };
   let pendingIterationPrompts = new Map(); // For iteration limit prompts
+  let pendingRegionCapture = null; // Resolve fn for region screenshot flow
   let activeStreams = new Map(); // tabId -> abort controller
   let currentStreamWindowId = null; // Window ID for targeted message sending
 
@@ -71,7 +137,7 @@
     };
 
     taskHistory.push(task);
-    console.log(`[TaskHistory] Added task: "${task.userMessage.slice(0, 50)}..." (${taskHistory.length} total)`);
+    debugLog('INFO', `[TaskHistory] Added task: "${task.userMessage.slice(0, 50)}..." (${taskHistory.length} total)`);
 
     // Maintain sliding window
     if (taskHistory.length > MAX_TASK_HISTORY) {
@@ -81,6 +147,69 @@
 
   // Expose getTaskHistory for tool-router.js
   window.getTaskHistory = getTaskHistory;
+
+  // Expose sidebarTabs for tool-router.js (API observer scope gate)
+  window.sidebarTabs = sidebarTabs;
+
+  // Expose workflowRecording for tool-router.js
+  window.workflowRecording = workflowRecording;
+
+  const WORKFLOWS_KEY = 'foxhole_workflows';
+  window.WORKFLOWS_KEY = WORKFLOWS_KEY;
+
+  async function getStoredWorkflows() {
+    const data = await browser.storage.local.get(WORKFLOWS_KEY);
+    return data[WORKFLOWS_KEY] || {};
+  }
+
+  async function saveStoredWorkflow(name, steps, description, url) {
+    const workflows = await getStoredWorkflows();
+    workflows[name] = {
+      name,
+      description: description || '',
+      steps,
+      url: url || null,
+      created: Date.now(),
+      runCount: 0,
+      lastRun: null
+    };
+    await browser.storage.local.set({ [WORKFLOWS_KEY]: workflows });
+    return workflows[name];
+  }
+
+  async function runStoredWorkflow(name) {
+    const workflows = await getStoredWorkflows();
+    const workflow = workflows[name];
+    if (!workflow) return { error: `Workflow "${name}" not found. Use list_workflows to see available workflows.` };
+
+    const results = [];
+    for (let i = 0; i < workflow.steps.length; i++) {
+      const step = workflow.steps[i];
+      sendToSidebar({ type: 'STREAM_DELTA', text: `\n*Step ${i + 1}/${workflow.steps.length}: ${step._label}*` });
+      try {
+        const result = await window.executeTool(step.tool, step.input);
+        results.push({ step: step._label, ok: true, result });
+        if (step.tool === 'navigate') {
+          await new Promise(r => setTimeout(r, 1500));
+        } else {
+          await new Promise(r => setTimeout(r, 800));
+        }
+      } catch (e) {
+        results.push({ step: step._label, ok: false, error: e.message });
+        return { error: `Step ${i + 1} failed: ${e.message}`, completedSteps: i, results };
+      }
+    }
+
+    workflows[name].runCount = (workflows[name].runCount || 0) + 1;
+    workflows[name].lastRun = Date.now();
+    await browser.storage.local.set({ [WORKFLOWS_KEY]: workflows });
+
+    return { success: true, stepsRun: results.length, name };
+  }
+
+  window.getStoredWorkflows = getStoredWorkflows;
+  window.saveStoredWorkflow = saveStoredWorkflow;
+  window.runStoredWorkflow = runStoredWorkflow;
 
   // Initialize on extension load
   init();
@@ -92,7 +221,10 @@
     setupBrowserAction();
     setupTabCleanup();
     setupCommandListeners();
-    console.log('Foxhole for Claude background script initialized');
+    if (window.SiteKnowledge && typeof window.SiteKnowledge._cleanupOldPartitions === 'function') {
+      window.SiteKnowledge._cleanupOldPartitions().catch(() => {});
+    }
+    debugLog('INFO', 'Foxhole for Claude background script initialized');
   }
 
   // Listen for keyboard shortcut commands
@@ -103,7 +235,7 @@
           const [tab] = await browser.tabs.query({ active: true, currentWindow: true });
           if (tab?.id) {
             const result = await browser.tabs.sendMessage(tab.id, { action: 'clean_text', params: {} }, { frameId: 0 });
-            console.log('[CleanText] Result:', result);
+            debugLog('INFO', '[CleanText] Result:', result);
           }
         } catch (error) {
           console.error('[CleanText] Error:', error);
@@ -116,6 +248,8 @@
   function setupTabCleanup() {
     browser.tabs.onRemoved.addListener((tabId) => {
       tabAutonomyModes.delete(tabId);
+      persistSwState();
+      sidebarTabs.delete(tabId);
     });
   }
 
@@ -180,6 +314,8 @@
 
   // Setup browser action click to toggle sidebar
   function setupBrowserAction() {
+    // Chrome MV3 uses sidePanel.setPanelBehavior (set in service-worker.js) — no browserAction
+    if (!browser.browserAction) return;
     browser.browserAction.onClicked.addListener(() => {
       browser.sidebarAction.toggle();
     });
@@ -216,7 +352,8 @@
         'maxToolIterations',
         'temperature',
         'highRiskTools',
-        'debugMode'
+        'debugMode',
+        'passiveObserver'
       ]);
 
       if (result.apiKey) {
@@ -239,6 +376,9 @@
       // Debug mode - log full API requests
       debugMode = result.debugMode === true;
       window.debugMode = debugMode;
+
+      // Passive observer — default false (opt-in via Settings → Privacy)
+      window.passiveObserverEnabled = result.passiveObserver === true;
     } catch (error) {
       console.error('Failed to load settings:', error);
     }
@@ -247,6 +387,34 @@
   // Setup message listeners
   function setupMessageListeners() {
     browser.runtime.onMessage.addListener(handleMessage);
+
+    // Accept sidebar port connections — keeps the port alive so onDisconnect
+    // only fires when the background actually restarts, not immediately on connect.
+    browser.runtime.onConnect.addListener((port) => {
+      if (port.name === 'sidebar') {
+        port.onDisconnect.addListener(() => {});
+      }
+    });
+
+    // Track tab navigation during workflow recording
+    browser.tabs.onUpdated.addListener((tabId, changeInfo) => {
+      if (!workflowRecording.active || tabId !== workflowRecording.tabId || !changeInfo.url) return;
+      try {
+        const newUrl = new URL(changeInfo.url);
+        const lastUrl = workflowRecording.lastUrl ? new URL(workflowRecording.lastUrl) : null;
+        if (lastUrl && newUrl.hostname === lastUrl.hostname && newUrl.pathname === lastUrl.pathname) {
+          workflowRecording.lastUrl = changeInfo.url;
+          return;
+        }
+      } catch (e) {}
+      workflowRecording.steps.push({
+        tool: 'navigate',
+        input: { url: changeInfo.url },
+        _label: `Navigate to ${changeInfo.url}`
+      });
+      workflowRecording.lastUrl = changeInfo.url;
+      sendToSidebar({ type: 'RECORDING_STEP_COUNT', count: workflowRecording.steps.length });
+    });
 
     // Listen for storage changes to update settings
     browser.storage.onChanged.addListener(async (changes, area) => {
@@ -268,7 +436,7 @@
 
       if (changes.maxTokens && claudeApi) {
         claudeApi.setMaxTokens(changes.maxTokens.newValue);
-        console.log(`[Settings] Max tokens updated to ${changes.maxTokens.newValue}`);
+        debugLog('INFO', `[Settings] Max tokens updated to ${changes.maxTokens.newValue}`);
       }
 
       if (changes.autonomyMode) {
@@ -278,18 +446,18 @@
       if (changes.maxToolIterations) {
         configuredMaxToolIterations = changes.maxToolIterations.newValue;
         currentTaskMaxIterations = changes.maxToolIterations.newValue;
-        console.log(`[Settings] Max tool iterations updated to ${configuredMaxToolIterations}`);
+        debugLog('INFO', `[Settings] Max tool iterations updated to ${configuredMaxToolIterations}`);
       }
 
       if (changes.highRiskTools) {
         configuredHighRiskTools = changes.highRiskTools.newValue;
-        console.log(`[Settings] High-risk tools updated:`, configuredHighRiskTools);
+        debugLog('INFO', `[Settings] High-risk tools updated:`, configuredHighRiskTools);
       }
 
       if (changes.debugMode !== undefined) {
         debugMode = changes.debugMode.newValue === true;
         window.debugMode = debugMode;
-        console.log(`[Settings] Debug mode: ${debugMode ? 'ON' : 'OFF'}`);
+        debugLog('INFO', `[Settings] Debug mode: ${debugMode ? 'ON' : 'OFF'}`);
       }
     });
   }
@@ -303,6 +471,10 @@
         handleChatMessage(payload, sender);
         return true;
 
+      case 'SIDEBAR_TAB_OPENED':
+        if (payload.tabId) sidebarTabs.add(payload.tabId);
+        return true;
+
       case 'SET_AUTONOMY_MODE': {
         // Store per-tab autonomy mode using the actual active tab ID
         // (sidebar's currentTabId can diverge from browser.tabs.query result)
@@ -310,6 +482,7 @@
         const modeTabId = activeTab?.id || payload.tabId;
         if (modeTabId) {
           tabAutonomyModes.set(modeTabId, payload.mode);
+          persistSwState();
         }
         // Also set the default so new tabs inherit it
         defaultAutonomyMode = payload.mode;
@@ -318,6 +491,9 @@
 
       case 'TAKE_SCREENSHOT':
         return handleTakeScreenshot();
+
+      case 'TAKE_REGION_SCREENSHOT':
+        return captureRegionScreenshot().catch(err => ({ cancelled: true, error: err.message }));
 
       case 'TOOL_CONFIRMATION':
         handleToolConfirmation(payload);
@@ -348,6 +524,33 @@
           console.error('downloads.open failed:', e);
           return { success: false, error: e.message };
         }
+
+      case 'regionSelected':
+        return handleRegionSelected(payload);
+
+      case 'RECORDING_STEP':
+        if (workflowRecording.active && sender.tab?.id === workflowRecording.tabId) {
+          workflowRecording.steps.push(payload.step);
+          sendToSidebar({ type: 'RECORDING_STEP_COUNT', count: workflowRecording.steps.length });
+        }
+        return true;
+
+      case 'GET_RECORDING_STATE':
+        return { active: workflowRecording.active, stepCount: workflowRecording.steps.length };
+
+      case 'GET_WORKFLOWS': {
+        const wfs = await getStoredWorkflows();
+        return { workflows: Object.values(wfs) };
+      }
+
+      case 'DELETE_WORKFLOW': {
+        const wfs2 = await getStoredWorkflows();
+        if (message.name && wfs2[message.name]) {
+          delete wfs2[message.name];
+          await browser.storage.local.set({ [WORKFLOWS_KEY]: wfs2 });
+        }
+        return { workflows: Object.values(wfs2) };
+      }
 
       // Content script messages - acknowledge but don't process
       case 'content_script_ready':
@@ -450,9 +653,9 @@
       case 'GET_OBSERVER_COUNTS': {
         const domain = payload.domain;
         if (!domain) return { api: 0, dom: 0 };
-        const apiPatterns = window.ApiObserver ? window.ApiObserver.getPatterns(domain) : {};
+        const apiCount = window.ApiObserver ? window.ApiObserver.getQualifyingCount(domain) : 0;
         const domCount = window.InteractionObserver ? window.InteractionObserver.getPatternCount(domain) : 0;
-        return { api: Object.keys(apiPatterns).length, dom: domCount };
+        return { api: apiCount, dom: domCount };
       }
 
       default:
@@ -471,6 +674,7 @@
     // Reset iteration limit and tool call count at start of new task
     currentTaskMaxIterations = configuredMaxToolIterations;
     currentTaskToolCallCount = 0;
+    currentTaskScreenshotCount = 0;
     recentToolCalls = [];
 
     // Store window ID for targeted message sending
@@ -484,14 +688,15 @@
     // Set autonomy mode for this tab (from sidebar's current setting)
     if (tabId && autonomyMode) {
       tabAutonomyModes.set(tabId, autonomyMode);
+      persistSwState();
     }
 
     // Lazy-load API key if not yet initialized (handles race condition on extension reload)
     if (!claudeApi) {
-      console.log('[Background] claudeApi not ready, attempting to load from storage...');
+      debugLog('INFO', '[Background] claudeApi not ready, attempting to load from storage...');
       claudeApi = await createClaudeApiFromStorage();
       if (claudeApi) {
-        console.log('[Background] claudeApi initialized from lazy load');
+        debugLog('INFO', '[Background] claudeApi initialized from lazy load');
       } else {
         sendToSidebar({
           type: 'STREAM_ERROR',
@@ -535,13 +740,23 @@
         // Check if this is a token overflow error
         const isTokenOverflow = error.message?.includes('too long') ||
                                error.message?.includes('maximum') ||
-                               error.message?.includes('tokens');
+                               error.message?.includes('tokens') ||
+                               error.message?.includes('prompt');
 
         if (isTokenOverflow) {
-          sendToSidebar({
-            type: 'STREAM_ERROR',
-            error: 'Context too large. Try clearing the chat and starting fresh, or ask for smaller chunks of data.'
-          });
+          // Auto-recover: emergency compress to last 2 turns and retry once
+          debugLog('INFO', '[ContextOverflow] Auto-compressing and retrying...');
+          const emergency = aggressivelyCompressConversation(sanitizedConversation, 2);
+          try {
+            sendToSidebar({ type: 'STREAM_DELTA', text: '\n\n*[Context limit hit — auto-compressed history, retrying...]*\n\n' });
+            await streamConversation(emergency, tabId, tabUrl, abortController.signal);
+          } catch (retryError) {
+            console.error('[ContextOverflow] Retry after compression failed:', retryError);
+            sendToSidebar({
+              type: 'STREAM_ERROR',
+              error: 'Context too large even after compression. Please clear the chat to continue.'
+            });
+          }
         } else {
           sendToSidebar({
             type: 'STREAM_ERROR',
@@ -550,6 +765,15 @@
         }
       }
     } finally {
+      // If the stream was aborted (either during streaming or during tool execution),
+      // STREAM_END is never sent by streamConversation — send it here so the sidebar
+      // resets its UI. This covers both abort paths:
+      //   1. AbortError thrown from streaming loop (silently caught above)
+      //   2. signal.aborted checked in handleToolCalls loop (returns normally, no throw)
+      if (abortController.signal.aborted) {
+        sendToSidebar({ type: 'STREAM_END' });
+      }
+
       // Disable selection mode if it was left on during the task
       if (tabId) {
         browser.tabs.sendMessage(tabId, { action: 'toggle_selection_mode', params: { enable: false } }, { frameId: 0 }).catch(() => {});
@@ -573,7 +797,7 @@
     // TODO: Externalize to settings (e.g., maxAutoContinuations: 1-5, default 3)
     const MAX_CONTINUATIONS = 3;
 
-    console.log(`[StreamConversation] Starting iteration=${iteration}, continuation=${continuationCount}`);
+    debugLog('INFO', `[StreamConversation] Starting iteration=${iteration}, continuation=${continuationCount}`);
 
     // Auto-compress if approaching context limit
     conversation = maybeCompressConversation(conversation);
@@ -598,22 +822,22 @@
 
       if (userChoice === -1) {
         // User wants unlimited - set to hard cap (not Infinity)
-        console.log(`[ToolLimit] User enabled UNLIMITED mode (capped at ${HARD_TOOL_CALL_CAP})`);
+        debugLog('INFO', `[ToolLimit] User enabled UNLIMITED mode (capped at ${HARD_TOOL_CALL_CAP})`);
         currentTaskMaxIterations = HARD_TOOL_CALL_CAP;
         // Continue with the conversation (don't return, fall through to normal flow)
       } else if (userChoice === -2) {
         // User wants immediate stop - no summary
-        console.log(`[ToolLimit] User chose immediate stop (no summary)`);
+        debugLog('INFO', `[ToolLimit] User chose immediate stop (no summary)`);
         sendToSidebar({ type: 'STREAM_END' });
         return;
       } else if (userChoice > 0) {
         // User wants to continue - update the effective limit for THIS task only
-        console.log(`[ToolLimit] User allowed ${userChoice} more tool calls`);
+        debugLog('INFO', `[ToolLimit] User allowed ${userChoice} more tool calls`);
         currentTaskMaxIterations = currentTaskToolCallCount + userChoice;
         // Continue with the conversation (don't return, fall through to normal flow)
       } else {
         // User chose to stop with summary
-        console.log('[ToolLimit] User chose to stop, generating summary');
+        debugLog('INFO', '[ToolLimit] User chose to stop, generating summary');
 
         const summaryConversation = [
           ...conversation,
@@ -625,7 +849,7 @@
 
         // Make final call WITHOUT tools to force text-only response
         try {
-          const systemPrompt = await buildSystemPrompt(tabId, tabUrl);
+          const systemPrompt = await buildSystemPrompt(tabId, tabUrl, conversation);
           const stream = claudeApi.streamMessage(summaryConversation, [], systemPrompt);
 
           for await (const event of stream) {
@@ -647,10 +871,10 @@
     }
 
     if (currentTaskToolCallCount > 0) {
-      console.log(`[ToolCalls] Current count: ${currentTaskToolCallCount}/${currentTaskMaxIterations}`);
+      debugLog('INFO', `[ToolCalls] Current count: ${currentTaskToolCallCount}/${currentTaskMaxIterations}`);
     }
 
-    const systemPrompt = await buildSystemPrompt(tabId, tabUrl);
+    const systemPrompt = await buildSystemPrompt(tabId, tabUrl, conversation);
 
     try {
       const stream = claudeApi.streamMessage(
@@ -722,11 +946,11 @@
         if (event.type === 'message_delta') {
           if (event.delta?.stop_reason) {
             stopReason = event.delta.stop_reason;
-            console.log(`[StreamConversation] Received stop_reason: ${stopReason}`);
+            debugLog('INFO', `[StreamConversation] Received stop_reason: ${stopReason}`);
           }
           if (event.usage?.output_tokens) {
             outputTokensUsed = event.usage.output_tokens;
-            console.log(`[StreamConversation] Output tokens used: ${outputTokensUsed}/${claudeApi.maxTokens}`);
+            debugLog('INFO', `[StreamConversation] Output tokens used: ${outputTokensUsed}/${claudeApi.maxTokens}`);
           }
         }
       }
@@ -736,7 +960,7 @@
       const hasPartialToolCall = currentToolUse !== null || currentToolInputJson.length > 0;
       const toolUses = currentAssistantContent.filter(c => c.type === 'tool_use');
 
-      console.log(`[StreamConversation] Stream ended: stopReason=${stopReason}, outputTokens=${outputTokensUsed}, ` +
+      debugLog('INFO', `[StreamConversation] Stream ended: stopReason=${stopReason}, outputTokens=${outputTokensUsed}, ` +
                   `truncated=${wasTruncated}, partialTool=${hasPartialToolCall}, completedTools=${toolUses.length}`);
 
       // Handle truncation with auto-continuation
@@ -813,8 +1037,10 @@
           .map(c => c.text)
           .join('\n');
 
-        const STALLED_PATTERN = /\b(let me|i'll|i will|now i|going to|about to)\b.{0,30}\b(screenshot|click|check|verify|take a|look at|scroll|query|execute|navigate|search)\b/i;
-        const MAX_AUTO_CONTINUES = 3;
+        // Deliberately excludes "screenshot" and "scroll" — those form runaway loops when nudged.
+        // Only nudge for single-step actions that clearly need one tool call to complete.
+        const STALLED_PATTERN = /\b(let me|i'll|i will|now i|going to|about to)\b.{0,30}\b(click|verify|check|query|execute|navigate|fetch)\b/i;
+        const MAX_AUTO_CONTINUES = 1;
 
         if (STALLED_PATTERN.test(assistantText) && iteration < MAX_AUTO_CONTINUES) {
           console.warn(`[AutoContinue] Claude narrated a planned action without a tool call. Nudging to continue (iteration ${iteration + 1}).`);
@@ -862,10 +1088,10 @@
 
           // Log cache performance for debugging
           if (usage.cache_read_input_tokens > 0) {
-            console.log(`[PromptCache] Cache HIT: ${usage.cache_read_input_tokens} tokens read from cache (90% savings)`);
+            debugLog('INFO', `[PromptCache] Cache HIT: ${usage.cache_read_input_tokens} tokens read from cache (90% savings)`);
           }
           if (usage.cache_creation_input_tokens > 0) {
-            console.log(`[PromptCache] Cache WRITE: ${usage.cache_creation_input_tokens} tokens cached for future use`);
+            debugLog('INFO', `[PromptCache] Cache WRITE: ${usage.cache_creation_input_tokens} tokens cached for future use`);
           }
         }
         break;
@@ -1079,6 +1305,28 @@
   // Detect repetitive tool call patterns (loops)
   function detectToolLoop(calls) {
     if (calls.length < 3) return null;
+
+    // Screenshot/scroll abuse: more than 4 screenshots in the last 8 calls.
+    // Each screenshot differs so result-based checks miss this. Count-based catches it.
+    const SCREENSHOT_TOOLS = new Set(['take_screenshot', 'take_region_screenshot', 'take_element_screenshot']);
+    const last8 = calls.slice(-8);
+    const screenshotCount = last8.filter(c => SCREENSHOT_TOOLS.has(c.name)).length;
+    if (screenshotCount >= 4) {
+      return `SCREENSHOT LOOP DETECTED: You have taken ${screenshotCount} screenshots in the last ${last8.length} tool calls. ` +
+             `This is a runaway loop. STOP immediately. Screenshots cost 10-50k tokens each. ` +
+             `Use get_page_content, execute_script, or get_accessibility_tree to extract text data instead. ` +
+             `Tell the user what you found so far and ask what they actually need.`;
+    }
+
+    // Scroll + screenshot alternating: scroll_to / take_screenshot repeated
+    if (calls.length >= 6) {
+      const last6 = calls.slice(-6);
+      const scrollScreenPattern = last6.every(c => c.name === 'scroll_to' || SCREENSHOT_TOOLS.has(c.name));
+      if (scrollScreenPattern) {
+        return `SCROLL+SCREENSHOT LOOP DETECTED: You are alternating scroll_to and take_screenshot repeatedly. ` +
+               `STOP. Use get_page_content or execute_script to extract content. Screenshots are not the right tool for reading page data.`;
+      }
+    }
 
     // Single-tool repeat: same name + same summary 3x in a row
     const last3 = calls.slice(-3);
@@ -1318,7 +1566,7 @@
       compressed.push(msg);
     }
 
-    console.log(`[ContextCompression] Compressed ${conversation.length} messages to ${compressed.length} (kept ${keepRecentTurns} recent turns)`);
+    debugLog('INFO', `[ContextCompression] Compressed ${conversation.length} messages to ${compressed.length} (kept ${keepRecentTurns} recent turns)`);
 
     return compressed;
   }
@@ -1393,10 +1641,10 @@
     const estimatedTokens = estimateConversationTokens(conversation);
     const threshold = MAX_CONTEXT_TOKENS * COMPRESSION_THRESHOLD;
 
-    console.log(`[ContextCompression] Estimated tokens: ${estimatedTokens}, threshold: ${threshold}`);
+    debugLog('INFO', `[ContextCompression] Estimated tokens: ${estimatedTokens}, threshold: ${threshold}`);
 
     if (estimatedTokens > threshold) {
-      console.log(`[ContextCompression] Triggering aggressive compression (${estimatedTokens} > ${threshold})`);
+      debugLog('INFO', `[ContextCompression] Triggering aggressive compression (${estimatedTokens} > ${threshold})`);
       return aggressivelyCompressConversation(conversation);
     }
 
@@ -1435,6 +1683,21 @@
       if (signal?.aborted) break;
 
       const { id, name, input } = toolUse;
+
+      // Hard cap on screenshots per task — this catches scroll+shoot loops before loop detection can.
+      const SCREENSHOT_TOOL_NAMES = ['take_screenshot', 'take_region_screenshot', 'take_element_screenshot'];
+      if (SCREENSHOT_TOOL_NAMES.includes(name)) {
+        currentTaskScreenshotCount++;
+        if (currentTaskScreenshotCount > SCREENSHOT_CAP) {
+          const msg = `SCREENSHOT LIMIT: You have taken ${currentTaskScreenshotCount} screenshots this task (max ${SCREENSHOT_CAP}). ` +
+                      `Screenshots cost 10-50k tokens each. This is almost certainly a loop. ` +
+                      `Use get_page_content, execute_script, or get_accessibility_tree instead. Stop and report what you have.`;
+          toolResults.push({ type: 'tool_result', tool_use_id: id, content: msg });
+          sendToSidebar({ type: 'STREAM_TOOL_USE', toolId: id, toolName: name, toolInput: input });
+          sendToSidebar({ type: 'TOOL_RESULT', toolId: id, result: msg, isError: true });
+          continue;
+        }
+      }
 
       // In 'ask' mode (default), high-risk tools require confirmation.
       // In 'auto' mode (skip all), nothing requires confirmation.
@@ -1476,16 +1739,16 @@
 
       // Increment tool call counter
       currentTaskToolCallCount++;
-      console.log(`[ToolCalls] Incrementing count to ${currentTaskToolCallCount}`);
+      debugLog('INFO', `[ToolCalls] Incrementing count to ${currentTaskToolCallCount}`);
 
       // Execute the tool
       try {
-        console.log(`Executing tool: ${name}`, input);
+        debugLog('INFO', `Executing tool: ${name}`, input);
         const result = await window.executeTool(name, input);
-        console.log(`Tool result (${name}):`, result);
+        debugLog('INFO', `Tool result (${name}):`, result);
 
         // Feed to passive interaction observer
-        if (window.InteractionObserver && tabUrl) {
+        if (window.InteractionObserver && window.passiveObserverEnabled !== false && tabUrl) {
           try {
             const domain = new URL(tabUrl).hostname.replace(/^www\./, '');
             window.InteractionObserver.processToolResult(name, input, result, domain);
@@ -1760,6 +2023,67 @@
     }
   }
 
+  // Handle region selection result from content script
+  function handleRegionSelected(payload) {
+    if (!pendingRegionCapture) return true;
+    const resolve = pendingRegionCapture;
+    pendingRegionCapture = null;
+    resolve(payload);
+    return true;
+  }
+
+  // Capture a cropped region screenshot — called by sidebar or tool router
+  async function captureRegionScreenshot() {
+    const [tab] = await browser.tabs.query({ active: true, currentWindow: true });
+    if (!tab?.id) throw new Error('No active tab');
+
+    // Tell content script to start region selection
+    await browser.tabs.sendMessage(tab.id, { action: 'startRegionSelection', params: {} }, { frameId: 0 });
+
+    // Wait for user to draw the region (60s timeout guards against navigation/disconnect)
+    const result = await new Promise((resolve, reject) => {
+      pendingRegionCapture = resolve;
+      setTimeout(() => {
+        if (pendingRegionCapture === resolve) {
+          pendingRegionCapture = null;
+          reject(new Error('Region selection timed out'));
+        }
+      }, 60000);
+    });
+
+    if (result.cancelled) {
+      return { cancelled: true };
+    }
+
+    const { bounds } = result;
+
+    // Capture full visible tab
+    const dataUrl = await browser.tabs.captureVisibleTab(null, { format: 'png' });
+
+    // Crop using OffscreenCanvas (available in MV2 background page)
+    const resp = await fetch(dataUrl);
+    const blob = await resp.blob();
+    const bitmap = await createImageBitmap(blob);
+
+    const canvas = new OffscreenCanvas(bounds.width, bounds.height);
+    const ctx = canvas.getContext('2d');
+    ctx.drawImage(bitmap, bounds.left, bounds.top, bounds.width, bounds.height, 0, 0, bounds.width, bounds.height);
+    bitmap.close();
+
+    const croppedBlob = await canvas.convertToBlob({ type: 'image/png' });
+    const reader = new FileReader();
+    const croppedDataUrl = await new Promise((resolve, reject) => {
+      reader.onloadend = () => resolve(reader.result);
+      reader.onerror = reject;
+      reader.readAsDataURL(croppedBlob);
+    });
+
+    return { screenshot: croppedDataUrl };
+  }
+
+  // Expose captureRegionScreenshot for tool-router.js
+  window.captureRegionScreenshot = captureRegionScreenshot;
+
   // Handle screenshot request
   async function handleTakeScreenshot() {
     try {
@@ -1768,7 +2092,7 @@
         format: 'jpeg',
         quality: 80
       });
-      console.log(`[Screenshot] Captured ${Math.round(dataUrl.length / 1024)}KB`);
+      debugLog('INFO', `[Screenshot] Captured ${Math.round(dataUrl.length / 1024)}KB`);
       return { success: true, screenshot: dataUrl };
     } catch (error) {
       console.error('Screenshot error:', error);
@@ -1785,9 +2109,83 @@
     }
   }
 
+  // Scan the current conversation for key discoveries (tech, endpoints, selectors, saved specs)
+  // and return a formatted block to inject into the system prompt.
+  // This prevents Claude from restarting discovery after interruptions.
+  function extractSessionDiscoveries(conversation) {
+    if (!conversation || conversation.length < 2) return '';
+
+    const discoveries = { tech: null, endpoints: [], specsSaved: [], selectors: [] };
+
+    // Build tool_use_id → {name, input} from assistant turns
+    const toolMeta = new Map();
+    for (const msg of conversation) {
+      if (msg.role !== 'assistant') continue;
+      for (const block of (Array.isArray(msg.content) ? msg.content : [])) {
+        if (block.type === 'tool_use') toolMeta.set(block.id, { name: block.name, input: block.input });
+      }
+    }
+
+    // Extract from tool_result blocks in user turns
+    for (const msg of conversation) {
+      if (msg.role !== 'user') continue;
+      for (const block of (Array.isArray(msg.content) ? msg.content : [])) {
+        if (block.type !== 'tool_result') continue;
+        const info = toolMeta.get(block.tool_use_id);
+        if (!info) continue;
+
+        const text = typeof block.content === 'string'
+          ? block.content
+          : Array.isArray(block.content)
+            ? block.content.filter(b => b.type === 'text').map(b => b.text).join('\n')
+            : '';
+        if (!text) continue;
+
+        if (info.name === 'detect_page_tech') {
+          discoveries.tech = text.slice(0, 200).replace(/\n/g, ' ');
+        } else if (info.name === 'get_network_requests') {
+          // Extract endpoint lines (method + URL)
+          const lines = text.split('\n');
+          for (const line of lines) {
+            const m = line.match(/\b(GET|POST|PUT|PATCH|DELETE)\s+(https?:\/\/\S+)/);
+            if (m && !discoveries.endpoints.includes(`${m[1]} ${m[2]}`)) {
+              discoveries.endpoints.push(`${m[1]} ${m[2]}`);
+            }
+          }
+        } else if (info.name === 'save_site_spec' && info.input?.title) {
+          const entry = `[${info.input.type || 'spec'}] ${info.input.title}`;
+          if (!discoveries.specsSaved.includes(entry)) discoveries.specsSaved.push(entry);
+        } else if (info.name === 'get_accessibility_tree' || info.name === 'find_elements') {
+          // Capture tref_N handle lines
+          const trefLines = text.match(/tref_\d+[^\n]*/g) || [];
+          for (const t of trefLines.slice(0, 15)) {
+            if (!discoveries.selectors.includes(t)) discoveries.selectors.push(t);
+          }
+        }
+      }
+    }
+
+    const parts = [];
+    if (discoveries.tech) parts.push(`Tech: ${discoveries.tech}`);
+    if (discoveries.specsSaved.length) parts.push(`Specs saved this session:\n${discoveries.specsSaved.map(s => '  ' + s).join('\n')}`);
+    if (discoveries.endpoints.length) parts.push(`Endpoints observed this session:\n${discoveries.endpoints.slice(0, 20).map(e => '  ' + e).join('\n')}`);
+    if (discoveries.selectors.length) parts.push(`Elements found this session:\n${discoveries.selectors.slice(0, 12).map(s => '  ' + s).join('\n')}`);
+
+    if (!parts.length) return '';
+
+    return (
+      '\n\n┌─────────────────────────────────────────────────────────────┐\n' +
+      '│ SESSION DISCOVERIES — already found in this conversation    │\n' +
+      '│ DO NOT re-run discovery. Use these directly.                │\n' +
+      '└─────────────────────────────────────────────────────────────┘\n\n' +
+      parts.join('\n\n') +
+      '\n\n═══════════════════════════════════════════════════════════════\n'
+    );
+  }
+
   // Build system prompt with current page context and site knowledge
   // Returns structured array format for Anthropic prompt caching
-  async function buildSystemPrompt(tabId, tabUrl) {
+  async function buildSystemPrompt(tabId, tabUrl, conversation) {
     // Build dynamic context (site-specific, changes per domain)
     let dynamicContext = '';
 
@@ -1797,29 +2195,34 @@
       if (domain) {
         try {
           const path = new URL(tabUrl).pathname;
-          console.log(`[SiteKnowledge] Looking for knowledge: domain=${domain}, path=${path}`);
+          debugLog('INFO', `[SiteKnowledge] Looking for knowledge: domain=${domain}, path=${path}`);
 
           // Check for raw markdown first (user-edited takes priority)
           const rawKnowledge = await window.SiteKnowledge.getRaw(domain);
           if (rawKnowledge) {
-            // Raw knowledge is already formatted markdown - inject with clear header
             dynamicContext += `\n\n╔══════════════════════════════════════════════════════════════╗
 ║  SITE KNOWLEDGE FOR: ${domain.padEnd(41)}║
-║  ⚠ USE THESE SPECS FIRST — do not rediscover what's below  ║
+║  USE THESE SPECS — do not rediscover what is already here   ║
 ╚══════════════════════════════════════════════════════════════╝
 
 ${rawKnowledge}
 
 ═══════════════════════════════════════════════════════════════`;
-            console.log(`[SiteKnowledge] Injected raw knowledge (${rawKnowledge.length} chars) for ${domain}`);
+            debugLog('INFO', `[SiteKnowledge] Injected raw knowledge (${rawKnowledge.length} chars) for ${domain}`);
           } else {
             // Get structured knowledge for this path (includes global knowledge)
             const knowledge = await window.SiteKnowledge.getForPath(domain, path);
-            console.log(`[SiteKnowledge] Found ${knowledge.length} knowledge items`);
+            debugLog('INFO', `[SiteKnowledge] Found ${knowledge.length} knowledge items`);
             if (knowledge.length > 0) {
+              // Gate reminder at the top of the dynamic block — closest to the conversation,
+              // so it has highest attention when Claude generates a response.
+              const specCount = knowledge.length;
+              const specIndex = knowledge.slice(0, 10).map(k => `  [${k.type}] ${k.title}`).join('\n');
+              const gateHeader = `\n\n┌─────────────────────────────────────────────────────────────┐\n│ ${specCount} SPEC${specCount !== 1 ? 'S' : ''} LOADED FOR ${domain} — USE BEFORE RUNNING ANY TOOL │\n└─────────────────────────────────────────────────────────────┘\n\nAvailable specs (check these before get_accessibility_tree / find_elements / execute_script):\n${specIndex}\n\nFull spec content follows. Use selector/endpoint/workflow from specs directly.\n`;
+              dynamicContext += gateHeader;
               const knowledgeText = window.SiteKnowledge.formatForPrompt(knowledge, domain);
               dynamicContext += knowledgeText;
-              console.log(`[SiteKnowledge] Injected knowledge:\n${knowledgeText.slice(0, 500)}...`);
+              debugLog('INFO', `[SiteKnowledge] Injected knowledge:\n${knowledgeText.slice(0, 500)}...`);
             }
           }
         } catch (error) {
@@ -1835,7 +2238,7 @@ ${rawKnowledge}
         const apiPatterns = window.ApiObserver.formatForPrompt(domain);
         if (apiPatterns) {
           dynamicContext += apiPatterns;
-          console.log(`[ApiObserver] Injected patterns for ${domain}`);
+          debugLog('INFO', `[ApiObserver] Injected patterns for ${domain}`);
         }
       } catch (e) {
         console.warn('[ApiObserver] Format error:', e);
@@ -1849,11 +2252,22 @@ ${rawKnowledge}
         const domPatterns = window.InteractionObserver.formatForPrompt(domain);
         if (domPatterns) {
           dynamicContext += domPatterns;
-          console.log(`[InteractionObserver] Injected patterns for ${domain}`);
+          debugLog('INFO', `[InteractionObserver] Injected patterns for ${domain}`);
         }
       } catch (e) {
         console.warn('[InteractionObserver] Format error:', e);
       }
+    }
+
+    // Inject session discoveries (what was found earlier in THIS conversation)
+    if (conversation) {
+      const sessionBlock = extractSessionDiscoveries(conversation);
+      if (sessionBlock) dynamicContext += sessionBlock;
+    }
+
+    // Inject current tab URL so Claude always knows where it is
+    if (tabUrl) {
+      dynamicContext += `\n\nCurrent tab URL: ${tabUrl}`;
     }
 
     // Add current autonomy mode info (per-tab setting)
@@ -1885,7 +2299,7 @@ ${rawKnowledge}
       cache_control: { type: 'ephemeral' }
     });
 
-    console.log(`[PromptCache] Built system prompt: ${systemBlocks.length} blocks, static=${basePrompt.length} chars, dynamic=${dynamicContext.length} chars`);
+    debugLog('INFO', `[PromptCache] Built system prompt: ${systemBlocks.length} blocks, static=${basePrompt.length} chars, dynamic=${dynamicContext.length} chars`);
 
     return systemBlocks;
   }
@@ -2127,7 +2541,7 @@ ${rawKnowledge}
 
     try {
       // Build the system prompt exactly as it would be sent
-      const systemPrompt = await buildSystemPrompt(tabId, tabUrl);
+      const systemPrompt = await buildSystemPrompt(tabId, tabUrl, conversation);
 
       // Build tools array with cache_control (exactly as sent to API)
       const tools = window.BROWSER_TOOLS.map((tool, index) => {
@@ -2178,7 +2592,7 @@ ${rawKnowledge}
     }
 
     try {
-      console.log('[ContextManager] Requesting summary from Claude...');
+      debugLog('INFO', '[ContextManager] Requesting summary from Claude...');
 
       // Use a minimal, fast call to summarize
       const response = await claudeApi.sendMessage([
@@ -2199,7 +2613,7 @@ ${rawKnowledge}
         }
       }
 
-      console.log('[ContextManager] Summary generated:', summary.slice(0, 100) + '...');
+      debugLog('INFO', '[ContextManager] Summary generated:', summary.slice(0, 100) + '...');
       return { summary };
 
     } catch (error) {

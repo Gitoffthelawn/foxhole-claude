@@ -117,6 +117,10 @@ function shouldCaptureResponseBody(details) {
 // webRequest Listeners for Network Capture
 // ==========================================================================
 
+// filterResponseData is Firefox-only; Chrome MV3 also forbids 'blocking' without enterprise policy
+const _hasFilterResponseData = typeof browser.webRequest.filterResponseData === 'function';
+const _onBeforeRequestOptions = _hasFilterResponseData ? ['blocking', 'requestBody'] : ['requestBody'];
+
 // Capture request initiation
 browser.webRequest.onBeforeRequest.addListener(
   (details) => {
@@ -137,8 +141,8 @@ browser.webRequest.onBeforeRequest.addListener(
 
     pendingRequests.set(requestId, request);
 
-    // Set up response body capture for XHR requests
-    if (shouldCaptureResponseBody(details)) {
+    // Set up response body capture for XHR requests (Firefox only — requires filterResponseData)
+    if (_hasFilterResponseData && shouldCaptureResponseBody(details)) {
       try {
         const filter = browser.webRequest.filterResponseData(requestId);
         const chunks = [];
@@ -194,7 +198,7 @@ browser.webRequest.onBeforeRequest.addListener(
     }
   },
   { urls: ['<all_urls>'] },
-  ['blocking', 'requestBody']
+  _onBeforeRequestOptions
 );
 
 // Capture request headers
@@ -230,8 +234,8 @@ browser.webRequest.onCompleted.addListener(
         addToNetworkBuffer(request.tabId, request);
       }
 
-      // Feed to passive API observer
-      if (window.ApiObserver) {
+      // Feed to passive API observer — only for sidebar tabs when observer is enabled
+      if (window.ApiObserver && window.passiveObserverEnabled === true && request.tabId >= 0 && window.sidebarTabs?.has(request.tabId)) {
         try {
           window.ApiObserver.processCompletedRequest(request);
         } catch (e) {
@@ -533,6 +537,22 @@ async function executeTool(toolName, toolInput) {
       case 'clean_text':
         return await sendToContentScript(tabId, 'clean_text', toolInput);
 
+      // Accessibility tree & element discovery
+      case 'get_accessibility_tree':
+        return await sendToContentScript(tabId, 'get_accessibility_tree', toolInput);
+
+      case 'find_elements':
+        return await sendToContentScript(tabId, 'find_elements', toolInput);
+
+      case 'fetch_with_session':
+        return await sendToContentScript(tabId, 'fetch_with_session', toolInput);
+
+      case 'upload_file':
+        return await sendToContentScript(tabId, 'upload_file', toolInput);
+
+      case 'handle_dialog':
+        return await sendToContentScript(tabId, 'handle_dialog', toolInput);
+
       // Developer Tools
       case 'detect_page_tech':
         return await handleDetectPageTech(tabId);
@@ -542,6 +562,65 @@ async function executeTool(toolName, toolInput) {
         return await handleAuditAccessibility(tabId, toolInput);
       case 'inspect_app_state':
         return await handleInspectAppState(tabId, toolInput);
+
+      // Workflow Recording
+      case 'start_recording': {
+        if (!window.workflowRecording) return { error: 'Workflow recording not initialized' };
+        window.workflowRecording.active = true;
+        window.workflowRecording.tabId = tabId;
+        window.workflowRecording.steps = [];
+        window.workflowRecording.lastUrl = tab.url;
+        try { await sendToContentScript(tabId, 'start_recording', {}); } catch (e) {}
+        return { recording: true, message: 'Recording started. Ask the user to perform the steps, then call stop_recording when done.' };
+      }
+
+      case 'stop_recording': {
+        if (!window.workflowRecording) return { error: 'Workflow recording not initialized' };
+        window.workflowRecording.active = false;
+        const recordedSteps = [...window.workflowRecording.steps];
+        window.workflowRecording.steps = [];
+        window.workflowRecording.tabId = null;
+        try { await sendToContentScript(tabId, 'stop_recording', {}); } catch (e) {}
+        if (recordedSteps.length === 0) return { steps: [], message: 'No steps were recorded. Make sure to perform actions after calling start_recording.' };
+        return {
+          steps: recordedSteps,
+          stepCount: recordedSteps.length,
+          summary: recordedSteps.map((s, i) => `${i + 1}. ${s._label}`).join('\n'),
+          message: `Recorded ${recordedSteps.length} step(s). Call save_workflow to save this workflow.`
+        };
+      }
+
+      case 'save_workflow': {
+        const { name: wfName, steps: wfSteps, description: wfDesc } = toolInput;
+        if (!wfName || !wfSteps?.length) return { error: 'name and steps are required' };
+        const saved = await window.saveStoredWorkflow(wfName, wfSteps, wfDesc, tab.url);
+        return { success: true, name: saved.name, stepCount: saved.steps.length };
+      }
+
+      case 'list_workflows': {
+        const workflows = await window.getStoredWorkflows();
+        const list = Object.values(workflows).map(w => ({
+          name: w.name,
+          description: w.description || '(no description)',
+          stepCount: w.steps.length,
+          runCount: w.runCount || 0,
+          created: new Date(w.created).toLocaleDateString()
+        }));
+        if (list.length === 0) return { workflows: [], message: 'No workflows saved yet. Use start_recording to create one.' };
+        return { workflows: list, count: list.length };
+      }
+
+      case 'run_workflow': {
+        return await window.runStoredWorkflow(toolInput.name);
+      }
+
+      case 'delete_workflow': {
+        const workflows = await window.getStoredWorkflows();
+        if (!workflows[toolInput.name]) return { error: `Workflow "${toolInput.name}" not found` };
+        delete workflows[toolInput.name];
+        await browser.storage.local.set({ [window.WORKFLOWS_KEY]: workflows });
+        return { success: true, deleted: toolInput.name };
+      }
 
       default:
         throw new Error(`Unknown tool: ${toolName}`);
@@ -651,55 +730,24 @@ async function handleTakeScreenshot(params) {
 
   // If saveTo is provided, save to Downloads folder
   if (saveTo) {
-    const blob = await fetch(dataUrl).then(r => r.blob());
-    const blobUrl = URL.createObjectURL(blob);
-
-    // Ensure filename has correct extension
     let filename = saveTo;
     const ext = `.${format}`;
     if (!filename.toLowerCase().endsWith(ext)) {
       filename = filename.replace(/\.\w+$/, '') + ext;
     }
 
-    try {
-      const downloadId = await browser.downloads.download({
-        url: blobUrl,
-        filename: filename,
-        saveAs: false
-      });
+    // dataUrl from captureVisibleTab is already a data URL — use it directly
+    await browser.downloads.download({
+      url: dataUrl,
+      filename: filename,
+      saveAs: false
+    });
 
-      // Wait for download to complete
-      await new Promise((resolve, reject) => {
-        const timeout = setTimeout(() => reject(new Error('Download timeout')), 10000);
-        const listener = (delta) => {
-          if (delta.id === downloadId && delta.state) {
-            if (delta.state.current === 'complete') {
-              clearTimeout(timeout);
-              browser.downloads.onChanged.removeListener(listener);
-              resolve();
-            } else if (delta.state.current === 'interrupted') {
-              clearTimeout(timeout);
-              browser.downloads.onChanged.removeListener(listener);
-              reject(new Error('Download interrupted'));
-            }
-          }
-        };
-        browser.downloads.onChanged.addListener(listener);
-      });
-
-      const [downloadInfo] = await browser.downloads.search({ id: downloadId });
-      URL.revokeObjectURL(blobUrl);
-
-      return {
-        saved: true,
-        filename: filename,
-        filePath: downloadInfo?.filename || filename,
-        message: `Screenshot saved to Downloads: ${filename}`
-      };
-    } catch (err) {
-      URL.revokeObjectURL(blobUrl);
-      throw err;
-    }
+    return {
+      saved: true,
+      filename,
+      message: `Screenshot saved to Downloads: ${filename}`
+    };
   }
 
   // Default: return base64 data for viewing
@@ -717,56 +765,20 @@ async function handleCreateMarkdown(params) {
     throw new Error('Markdown content is required');
   }
 
-  const timestamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
-  const filename = customFilename
-    ? `${customFilename.replace(/\.md$/i, '')}.md`
-    : `claude-output-${timestamp}.md`;
+  const title = customFilename
+    ? customFilename.replace(/\.md$/i, '')
+    : 'Claude Report';
 
-  const blob = new Blob([content], { type: 'text/markdown' });
-  const blobUrl = URL.createObjectURL(blob);
+  const key = 'foxhole_viewer_' + Date.now();
+  await browser.storage.local.set({ [key]: { type: 'markdown', title, content } });
 
-  try {
-    const downloadId = await browser.downloads.download({
-      url: blobUrl,
-      filename: filename,
-      saveAs: false
-    });
+  const viewerUrl = browser.runtime.getURL('viewer/viewer.html') + '#' + key;
+  await browser.tabs.create({ url: viewerUrl });
 
-    // Wait for download to complete
-    await new Promise((resolve, reject) => {
-      const timeout = setTimeout(() => reject(new Error('Download timeout')), 10000);
-      const listener = (delta) => {
-        if (delta.id === downloadId && delta.state) {
-          if (delta.state.current === 'complete') {
-            clearTimeout(timeout);
-            browser.downloads.onChanged.removeListener(listener);
-            resolve();
-          } else if (delta.state.current === 'interrupted') {
-            clearTimeout(timeout);
-            browser.downloads.onChanged.removeListener(listener);
-            reject(new Error('Download interrupted'));
-          }
-        }
-      };
-      browser.downloads.onChanged.addListener(listener);
-    });
-
-    const [downloadInfo] = await browser.downloads.search({ id: downloadId });
-    const filePath = downloadInfo?.filename || filename;
-
-    return {
-      success: true,
-      message: `Markdown saved: ${filename}`,
-      downloadId: downloadId,
-      filename: filename,
-      filePath: filePath,
-      needsUserClick: true,
-      isMarkdown: true,
-      markdownContent: content  // Include content for HTML conversion option
-    };
-  } finally {
-    URL.revokeObjectURL(blobUrl);
-  }
+  return {
+    success: true,
+    message: 'Report opened in new tab.',
+  };
 }
 
 async function handleCreateHtml(params) {
@@ -810,54 +822,16 @@ ${html}
 </html>`;
   }
 
-  const blob = new Blob([fullHtml], { type: 'text/html' });
-  const blobUrl = URL.createObjectURL(blob);
+  const key = 'foxhole_viewer_' + Date.now();
+  await browser.storage.local.set({ [key]: { type: 'html', content: fullHtml } });
 
-  const timestamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
-  const filename = `claude-report-${timestamp}.html`;
+  const viewerUrl = browser.runtime.getURL('viewer/viewer.html') + '#' + key;
+  await browser.tabs.create({ url: viewerUrl });
 
-  try {
-    const downloadId = await browser.downloads.download({
-      url: blobUrl,
-      filename: filename,
-      saveAs: false
-    });
-
-    // Wait for download to complete
-    await new Promise((resolve, reject) => {
-      const timeout = setTimeout(() => reject(new Error('Download timeout')), 10000);
-      const listener = (delta) => {
-        if (delta.id === downloadId && delta.state) {
-          if (delta.state.current === 'complete') {
-            clearTimeout(timeout);
-            browser.downloads.onChanged.removeListener(listener);
-            resolve();
-          } else if (delta.state.current === 'interrupted') {
-            clearTimeout(timeout);
-            browser.downloads.onChanged.removeListener(listener);
-            reject(new Error('Download interrupted'));
-          }
-        }
-      };
-      browser.downloads.onChanged.addListener(listener);
-    });
-
-    const [downloadInfo] = await browser.downloads.search({ id: downloadId });
-    const filePath = downloadInfo?.filename || filename;
-    const fileUrl = `file://${filePath}`;
-
-    return {
-      success: true,
-      message: `HTML report saved: ${filename}`,
-      downloadId: downloadId,
-      filename: filename,
-      filePath: filePath,
-      fileUrl: fileUrl,
-      needsUserClick: true
-    };
-  } finally {
-    URL.revokeObjectURL(blobUrl);
-  }
+  return {
+    success: true,
+    message: 'Report opened in new tab.',
+  };
 }
 
 async function handleOpenDownload(params) {
@@ -1550,7 +1524,7 @@ async function handleDeleteSiteSpec(tab, params) {
 // ==========================================================================
 
 async function handleFetchUrl(params) {
-  const { url, selector, maxLength = 15000 } = params;
+  const { url, selector, maxLength = 15000, method, headers: customHeaders, body: requestBody, raw } = params;
 
   if (!url) {
     throw new Error('url is required');
@@ -1568,6 +1542,39 @@ async function handleFetchUrl(params) {
   }
 
   console.log(`[FetchUrl] Fetching: ${url}`);
+
+  // Raw API mode: custom method/headers/body, return JSON directly.
+  // Runs from extension background — bypasses page CSP and CORS (Firefox MV2 with <all_urls>).
+  if (raw || method || customHeaders || requestBody) {
+    const fetchMethod = (method || 'GET').toUpperCase();
+    const mergedHeaders = Object.assign({}, customHeaders);
+    const fetchInit = { method: fetchMethod, headers: mergedHeaders };
+    if (requestBody && fetchMethod !== 'GET' && fetchMethod !== 'HEAD') {
+      if (typeof requestBody === 'object') {
+        fetchInit.body = JSON.stringify(requestBody);
+        if (!mergedHeaders['Content-Type'] && !mergedHeaders['content-type']) {
+          mergedHeaders['Content-Type'] = 'application/json';
+        }
+      } else {
+        fetchInit.body = requestBody;
+      }
+    }
+
+    try {
+      const resp = await fetch(url, fetchInit);
+      const respText = await resp.text();
+      const ct = resp.headers.get('content-type') || '';
+      let respBody = respText;
+      if (ct.includes('json')) {
+        try { respBody = JSON.parse(respText); } catch (_) {}
+      }
+      const respHeaders = {};
+      resp.headers.forEach((v, k) => { respHeaders[k] = v; });
+      return { status: resp.status, ok: resp.ok, headers: respHeaders, body: respBody, url: resp.url };
+    } catch (error) {
+      throw new Error(`fetch_url (raw) failed for ${url}: ${error.message}`);
+    }
+  }
 
   try {
     const response = await fetch(url, {
@@ -1588,55 +1595,79 @@ async function handleFetchUrl(params) {
 
     const html = await response.text();
 
-    // Parse HTML and extract text
     const parser = new DOMParser();
     const doc = parser.parseFromString(html, 'text/html');
 
-    // Remove unwanted elements
-    const removeSelectors = [
-      'script', 'style', 'noscript', 'iframe', 'svg',
-      'nav', 'footer', 'header', 'aside',
-      '[role="navigation"]', '[role="banner"]', '[role="contentinfo"]',
-      '.nav', '.navbar', '.footer', '.header', '.sidebar', '.ad', '.ads', '.advertisement',
-      '#nav', '#navbar', '#footer', '#header', '#sidebar'
-    ];
-    removeSelectors.forEach(sel => {
-      doc.querySelectorAll(sel).forEach(el => el.remove());
-    });
-
     let content;
+    let title = doc.title || null;
+    let byline = null;
+    let excerpt = null;
+    let extractionMethod;
+
     if (selector) {
-      // Extract specific element if selector provided
+      // Caller wants a specific element — skip Readability, extract directly
       const targetEl = doc.querySelector(selector);
       if (!targetEl) {
         throw new Error(`Selector "${selector}" not found on page`);
       }
       content = targetEl.textContent || '';
-    } else {
-      // Get main content area or body
-      const main = doc.querySelector('main, article, [role="main"], .main-content, #main, #content, .content');
-      content = (main || doc.body)?.textContent || '';
+      extractionMethod = 'selector';
+    } else if (typeof Readability !== 'undefined') {
+      // Use Mozilla Readability for clean article extraction
+      try {
+        const article = new Readability(doc).parse();
+        if (article && article.textContent && article.textContent.trim().length > 200) {
+          content = article.textContent;
+          title = article.title || title;
+          byline = article.byline || null;
+          excerpt = article.excerpt || null;
+          extractionMethod = 'readability';
+        }
+      } catch (e) {
+        console.warn('[FetchUrl] Readability failed, falling back:', e.message);
+      }
     }
 
-    // Clean up whitespace
+    // Fallback: manual extraction (Readability unavailable or returned too little)
+    if (!content) {
+      const removeSelectors = [
+        'script', 'style', 'noscript', 'iframe', 'svg',
+        'nav', 'footer', 'header', 'aside',
+        '[role="navigation"]', '[role="banner"]', '[role="contentinfo"]',
+        '.nav', '.navbar', '.footer', '.header', '.sidebar', '.ad', '.ads', '.advertisement',
+        '#nav', '#navbar', '#footer', '#header', '#sidebar'
+      ];
+      removeSelectors.forEach(sel => {
+        doc.querySelectorAll(sel).forEach(el => el.remove());
+      });
+      const main = doc.querySelector('main, article, [role="main"], .main-content, #main, #content, .content');
+      content = (main || doc.body)?.textContent || '';
+      extractionMethod = 'fallback';
+    }
+
+    // Normalize whitespace
     content = content
-      .replace(/\s+/g, ' ')           // Collapse whitespace
-      .replace(/\n\s*\n/g, '\n\n')    // Normalize paragraph breaks
+      .replace(/\t/g, ' ')
+      .replace(/[ \t]{2,}/g, ' ')
+      .replace(/\n[ \t]+/g, '\n')
+      .replace(/\n{3,}/g, '\n\n')
       .trim();
 
-    // Truncate if needed
     const truncated = content.length > maxLength;
     if (truncated) {
       content = content.substring(0, maxLength) + '\n\n[Content truncated...]';
     }
 
-    console.log(`[FetchUrl] Extracted ${content.length} chars from ${url}`);
+    console.log(`[FetchUrl] Extracted ${content.length} chars via ${extractionMethod} from ${url}`);
 
     return {
-      url: url,
-      title: doc.title || null,
+      url,
+      title,
+      byline,
+      excerpt,
       contentLength: content.length,
       truncated,
+      extractionMethod,
       content
     };
 
@@ -1683,171 +1714,19 @@ function handleRequestHistory() {
 
 // ==========================================================================
 // ELEMENT MARKING HANDLERS
+// Routed to content script — browser.tabs.executeScript is MV2-only
 // ==========================================================================
 
-/**
- * Mark elements matching selector/filter with data attribute and highlight style
- */
 async function handleMarkElements(tabId, params) {
-  const { selector, filter, label, style } = params;
-
-  if (!selector || !label) {
-    return { error: 'selector and label are required' };
-  }
-
-  const defaultStyle = 'outline: 3px solid #FFD700; outline-offset: 2px; background-color: rgba(255, 215, 0, 0.1);';
-  const highlightStyle = style || defaultStyle;
-
-  // Build the script to run in page context
-  const script = `
-    (() => {
-      const selector = ${JSON.stringify(selector)};
-      const filterFn = ${filter ? `(el) => { return ${filter}; }` : 'null'};
-      const label = ${JSON.stringify(label)};
-      const highlightStyle = ${JSON.stringify(highlightStyle)};
-
-      // Inject highlight styles if not already present
-      if (!document.getElementById('claude-mark-styles')) {
-        const styleEl = document.createElement('style');
-        styleEl.id = 'claude-mark-styles';
-        styleEl.textContent = '[data-claude-marked] { ' + highlightStyle + ' }';
-        document.head.appendChild(styleEl);
-      }
-
-      const elements = document.querySelectorAll(selector);
-      let marked = 0;
-
-      elements.forEach((el, idx) => {
-        let shouldMark = true;
-        if (filterFn) {
-          try {
-            shouldMark = filterFn(el);
-          } catch (e) {
-            console.warn('[Claude Mark] Filter error on element', idx, e);
-            shouldMark = false;
-          }
-        }
-
-        if (shouldMark) {
-          el.setAttribute('data-claude-marked', label);
-          el.setAttribute('data-claude-mark-index', marked.toString());
-          marked++;
-        }
-      });
-
-      return { marked, total: elements.length, label };
-    })()
-  `;
-
-  try {
-    const result = await browser.tabs.executeScript(tabId, {
-      code: script,
-      frameId: 0
-    });
-    return result[0] || { error: 'No result from script' };
-  } catch (error) {
-    return { error: error.message };
-  }
+  return await sendToContentScript(tabId, 'mark_elements', params);
 }
 
-/**
- * Get information about marked elements
- */
 async function handleGetMarkedElements(tabId, params) {
-  const { label, include_text = true } = params || {};
-
-  const script = `
-    (() => {
-      const label = ${JSON.stringify(label || null)};
-      const includeText = ${include_text};
-
-      const selector = label
-        ? '[data-claude-marked="' + label + '"]'
-        : '[data-claude-marked]';
-
-      const elements = document.querySelectorAll(selector);
-
-      // Group by label
-      const byLabel = {};
-      const items = [];
-
-      elements.forEach((el, idx) => {
-        const elLabel = el.getAttribute('data-claude-marked');
-        if (!byLabel[elLabel]) byLabel[elLabel] = 0;
-        byLabel[elLabel]++;
-
-        if (includeText) {
-          const text = el.textContent?.trim().slice(0, 100) || '';
-          items.push({
-            index: idx,
-            label: elLabel,
-            tag: el.tagName.toLowerCase(),
-            text: text + (el.textContent?.length > 100 ? '...' : '')
-          });
-        }
-      });
-
-      return {
-        totalMarked: elements.length,
-        byLabel,
-        items: includeText ? items : undefined
-      };
-    })()
-  `;
-
-  try {
-    const result = await browser.tabs.executeScript(tabId, {
-      code: script,
-      frameId: 0
-    });
-    return result[0] || { error: 'No result from script' };
-  } catch (error) {
-    return { error: error.message };
-  }
+  return await sendToContentScript(tabId, 'get_marked_elements', params);
 }
 
-/**
- * Clear marks from elements
- */
 async function handleClearMarkedElements(tabId, params) {
-  const { label } = params || {};
-
-  const script = `
-    (() => {
-      const label = ${JSON.stringify(label || null)};
-
-      const selector = label
-        ? '[data-claude-marked="' + label + '"]'
-        : '[data-claude-marked]';
-
-      const elements = document.querySelectorAll(selector);
-      let cleared = 0;
-
-      elements.forEach(el => {
-        el.removeAttribute('data-claude-marked');
-        el.removeAttribute('data-claude-mark-index');
-        cleared++;
-      });
-
-      // Remove style element if clearing all
-      if (!label) {
-        const styleEl = document.getElementById('claude-mark-styles');
-        if (styleEl) styleEl.remove();
-      }
-
-      return { cleared, label: label || 'all' };
-    })()
-  `;
-
-  try {
-    const result = await browser.tabs.executeScript(tabId, {
-      code: script,
-      frameId: 0
-    });
-    return result[0] || { error: 'No result from script' };
-  } catch (error) {
-    return { error: error.message };
-  }
+  return await sendToContentScript(tabId, 'clear_marked_elements', params);
 }
 
 // ==========================================================================
@@ -2561,8 +2440,11 @@ async function handleInspectAppState(tabId, params) {
 
       function getReactFiber(el) {
         if (!el) return null;
-        const key = Object.keys(el).find(k => k.startsWith('__reactFiber') || k.startsWith('__reactInternalInstance'));
-        return key ? el[key] : null;
+        // Firefox content scripts see Xray-wrapped DOM nodes — wrappedJSObject
+        // exposes page-world expandos like __reactFiber$* that are otherwise hidden.
+        const pageEl = (el && typeof el.wrappedJSObject !== 'undefined') ? el.wrappedJSObject : el;
+        const key = Object.keys(pageEl).find(k => k.startsWith('__reactFiber') || k.startsWith('__reactInternalInstance'));
+        return key ? pageEl[key] : null;
       }
 
       function getReactState(sel) {
@@ -2639,14 +2521,12 @@ async function handleInspectAppState(tabId, params) {
       function getVueState(sel) {
         const el = sel ? document.querySelector(sel) : document.querySelector('#app, [data-v-app], #__nuxt');
         if (!el) return { error: 'Vue root not found' };
+        const pageEl = (el && typeof el.wrappedJSObject !== 'undefined') ? el.wrappedJSObject : el;
 
         // Vue 3
-        if (el.__vue_app__) {
-          const app = el.__vue_app__;
+        if (pageEl.__vue_app__) {
           const result = { framework: 'Vue 3' };
-
-          // Get component data
-          const instance = el.__vue_app__?.config?.globalProperties?.$root || el.__vue__?.$root;
+          const instance = pageEl.__vue_app__?.config?.globalProperties?.$root || pageEl.__vue__?.$root;
 
           // Try Pinia
           if (window.__pinia) {
@@ -2663,8 +2543,8 @@ async function handleInspectAppState(tabId, params) {
         }
 
         // Vue 2
-        if (el.__vue__) {
-          const vm = el.__vue__;
+        if (pageEl.__vue__) {
+          const vm = pageEl.__vue__;
           const result = { framework: 'Vue 2', data: safeSerialize(vm.$data, 0) };
           if (vm.$store) result.vuex = safeSerialize(vm.$store.state, 0);
           return result;

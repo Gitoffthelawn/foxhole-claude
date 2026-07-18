@@ -21,10 +21,120 @@
  */
 
 // Storage keys
-const STORAGE_KEY = 'claude_site_knowledge';
+// Partitioned storage: siteSpecs_YYYY-MM-DD (one key per day, merged on read)
+const STORAGE_KEY_PREFIX = 'siteSpecs_';
+const LEGACY_UNIFIED_KEY = 'claude_site_knowledge';
 const META_KEY = 'claude_site_knowledge_meta';
 const RAW_KEY = 'claude_site_knowledge_raw';
 const MIGRATION_FLAG = 'claude_site_knowledge_migrated';
+const PARTITION_MIGRATION_FLAG = 'siteSpecs_partition_migrated';
+
+// ============================================================================
+// PARTITION HELPERS
+// ============================================================================
+
+function todayPartitionKey() {
+  const d = new Date();
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, '0');
+  const day = String(d.getDate()).padStart(2, '0');
+  return `${STORAGE_KEY_PREFIX}${y}-${m}-${day}`;
+}
+
+async function getAllPartitionKeys() {
+  const allData = await browser.storage.local.get(null);
+  return Object.keys(allData).filter(k => k.startsWith(STORAGE_KEY_PREFIX));
+}
+
+async function readAllPartitions() {
+  const keys = await getAllPartitionKeys();
+  if (keys.length === 0) return {};
+  const data = await browser.storage.local.get(keys);
+  const merged = {};
+  for (const key of keys) {
+    const partition = data[key] || {};
+    for (const domain in partition) {
+      if (!merged[domain]) merged[domain] = [];
+      merged[domain] = merged[domain].concat(partition[domain]);
+    }
+  }
+  return merged;
+}
+
+async function writeTodayPartition(knowledge) {
+  const key = todayPartitionKey();
+  await browser.storage.local.set({ [key]: knowledge });
+}
+
+async function removeFromPartitions(domain, id) {
+  const keys = await getAllPartitionKeys();
+  if (keys.length === 0) return false;
+  const data = await browser.storage.local.get(keys);
+  let found = false;
+  const updates = {};
+  for (const key of keys) {
+    const partition = data[key] || {};
+    if (!partition[domain]) continue;
+    const before = partition[domain].length;
+    partition[domain] = partition[domain].filter(item => item.id !== id);
+    if (partition[domain].length < before) {
+      found = true;
+      if (partition[domain].length === 0) delete partition[domain];
+      updates[key] = partition;
+    }
+  }
+  if (Object.keys(updates).length > 0) {
+    await browser.storage.local.set(updates);
+  }
+  return found;
+}
+
+async function clearDomainFromPartitions(domain) {
+  const keys = await getAllPartitionKeys();
+  if (keys.length === 0) return;
+  const data = await browser.storage.local.get(keys);
+  const updates = {};
+  for (const key of keys) {
+    const partition = data[key] || {};
+    if (domain in partition) {
+      delete partition[domain];
+      updates[key] = partition;
+    }
+  }
+  if (Object.keys(updates).length > 0) {
+    await browser.storage.local.set(updates);
+  }
+}
+
+async function cleanupOldPartitions() {
+  const cutoffMs = 90 * 24 * 60 * 60 * 1000;
+  const now = Date.now();
+  const keys = await getAllPartitionKeys();
+  const toRemove = keys.filter(k => {
+    const dateStr = k.slice(STORAGE_KEY_PREFIX.length);
+    const ts = new Date(dateStr).getTime();
+    return !isNaN(ts) && (now - ts) > cutoffMs;
+  });
+  if (toRemove.length > 0) {
+    await browser.storage.local.remove(toRemove);
+    console.log('[SiteKnowledge] Removed', toRemove.length, 'old partition(s):', toRemove);
+  }
+}
+
+async function ensurePartitionMigrated() {
+  const flag = await browser.storage.local.get(PARTITION_MIGRATION_FLAG);
+  if (flag[PARTITION_MIGRATION_FLAG]) return;
+
+  const existing = await browser.storage.local.get(LEGACY_UNIFIED_KEY);
+  const knowledge = existing[LEGACY_UNIFIED_KEY];
+  if (knowledge && Object.keys(knowledge).length > 0) {
+    const key = todayPartitionKey();
+    await browser.storage.local.set({ [key]: knowledge });
+    await browser.storage.local.remove(LEGACY_UNIFIED_KEY);
+    console.log('[SiteKnowledge] Migrated legacy unified key to partition', key);
+  }
+  await browser.storage.local.set({ [PARTITION_MIGRATION_FLAG]: true });
+}
 
 // Legacy storage keys (for migration)
 const LEGACY_EXPERIENCES_KEY = 'claude_experiences';
@@ -155,9 +265,9 @@ async function ensureMigrated() {
     };
   }
 
-  // Save migrated data
+  // Save migrated data (write to legacy unified key; ensurePartitionMigrated will move it to a partition)
   await browser.storage.local.set({
-    [STORAGE_KEY]: knowledge,
+    [LEGACY_UNIFIED_KEY]: knowledge,
     [RAW_KEY]: migratedRaw,
     [META_KEY]: migratedMeta,
     [MIGRATION_FLAG]: true
@@ -189,11 +299,10 @@ async function ensureMigrated() {
  */
 async function get(domain, path) {
   await ensureMigrated();
+  await ensurePartitionMigrated();
 
-  const data = await browser.storage.local.get(STORAGE_KEY);
-  const knowledge = data[STORAGE_KEY] || {};
+  const knowledge = await readAllPartitions();
 
-  // Clean up expired items
   await cleanupExpired(knowledge);
 
   const items = knowledge[domain] || [];
@@ -211,9 +320,9 @@ async function get(domain, path) {
  */
 async function getAll() {
   await ensureMigrated();
+  await ensurePartitionMigrated();
 
-  const data = await browser.storage.local.get(STORAGE_KEY);
-  const knowledge = data[STORAGE_KEY] || {};
+  const knowledge = await readAllPartitions();
   await cleanupExpired(knowledge);
   return knowledge;
 }
@@ -226,18 +335,15 @@ async function getAll() {
  */
 async function add(domain, item) {
   await ensureMigrated();
+  await ensurePartitionMigrated();
 
-  const data = await browser.storage.local.get(STORAGE_KEY);
-  const knowledge = data[STORAGE_KEY] || {};
+  // Check for duplicates across all partitions
+  const allKnowledge = await readAllPartitions();
+  const allDomainItems = allKnowledge[domain] || [];
 
-  if (!knowledge[domain]) {
-    knowledge[domain] = [];
-  }
-
-  // Check for duplicate by title (case-insensitive) or near-identical content
   const normalizeContent = s => (s || '').replace(/\s+/g, ' ').trim().toLowerCase();
   const newContent = normalizeContent(item.content);
-  const isDuplicate = knowledge[domain].some(existing =>
+  const isDuplicate = allDomainItems.some(existing =>
     existing.title.toLowerCase() === item.title.toLowerCase() ||
     (newContent.length > 20 && normalizeContent(existing.content) === newContent)
   );
@@ -262,16 +368,24 @@ async function add(domain, item) {
     expiryDays: item.expiryDays || DEFAULT_EXPIRY_DAYS
   };
 
-  knowledge[domain].push(newItem);
+  // Write to today's partition only
+  const todayKey = todayPartitionKey();
+  const todayData = await browser.storage.local.get(todayKey);
+  const todayPartition = todayData[todayKey] || {};
+  if (!todayPartition[domain]) todayPartition[domain] = [];
+  todayPartition[domain].push(newItem);
 
-  // Keep only last MAX_ITEMS_PER_DOMAIN
-  if (knowledge[domain].length > MAX_ITEMS_PER_DOMAIN) {
-    // Remove oldest items first
-    knowledge[domain].sort((a, b) => b.lastUsed - a.lastUsed);
-    knowledge[domain] = knowledge[domain].slice(0, MAX_ITEMS_PER_DOMAIN);
+  // Enforce per-domain cap across all partitions by removing oldest from today's if needed
+  if (allDomainItems.length + 1 > MAX_ITEMS_PER_DOMAIN) {
+    // Nothing to trim from today's partition beyond the new item — old items live in old partitions
+    // Just cap today's domain list if it itself exceeds the limit
+    if (todayPartition[domain].length > MAX_ITEMS_PER_DOMAIN) {
+      todayPartition[domain].sort((a, b) => b.lastUsed - a.lastUsed);
+      todayPartition[domain] = todayPartition[domain].slice(0, MAX_ITEMS_PER_DOMAIN);
+    }
   }
 
-  await browser.storage.local.set({ [STORAGE_KEY]: knowledge });
+  await browser.storage.local.set({ [todayKey]: todayPartition });
   console.log('[SiteKnowledge] Added item for', domain, ':', newItem.title);
 
   return newItem;
@@ -286,37 +400,38 @@ async function add(domain, item) {
  */
 async function update(domain, id, updates) {
   await ensureMigrated();
+  await ensurePartitionMigrated();
 
-  const data = await browser.storage.local.get(STORAGE_KEY);
-  const knowledge = data[STORAGE_KEY] || {};
-
-  if (!knowledge[domain]) {
+  const keys = await getAllPartitionKeys();
+  if (keys.length === 0) {
     console.log('[SiteKnowledge] Domain not found:', domain);
     return null;
   }
+  const data = await browser.storage.local.get(keys);
 
-  const index = knowledge[domain].findIndex(item => item.id === id);
-  if (index === -1) {
-    console.log('[SiteKnowledge] Item not found:', id);
-    return null;
+  for (const key of keys) {
+    const partition = data[key] || {};
+    if (!partition[domain]) continue;
+    const index = partition[domain].findIndex(item => item.id === id);
+    if (index === -1) continue;
+
+    const existing = partition[domain][index];
+    const updated = {
+      ...existing,
+      ...updates,
+      id: existing.id,
+      domain: existing.domain,
+      created: existing.created,
+      lastUsed: Date.now()
+    };
+    partition[domain][index] = updated;
+    await browser.storage.local.set({ [key]: partition });
+    console.log('[SiteKnowledge] Updated item:', id, 'for', domain);
+    return updated;
   }
 
-  const existing = knowledge[domain][index];
-  const updated = {
-    ...existing,
-    ...updates,
-    // Preserve immutable fields
-    id: existing.id,
-    domain: existing.domain,
-    created: existing.created,
-    lastUsed: Date.now()
-  };
-
-  knowledge[domain][index] = updated;
-  await browser.storage.local.set({ [STORAGE_KEY]: knowledge });
-  console.log('[SiteKnowledge] Updated item:', id, 'for', domain);
-
-  return updated;
+  console.log('[SiteKnowledge] Item not found:', id);
+  return null;
 }
 
 /**
@@ -327,30 +442,11 @@ async function update(domain, id, updates) {
  */
 async function deleteItem(domain, id) {
   await ensureMigrated();
+  await ensurePartitionMigrated();
 
-  const data = await browser.storage.local.get(STORAGE_KEY);
-  const knowledge = data[STORAGE_KEY] || {};
-
-  if (!knowledge[domain]) {
-    return false;
-  }
-
-  const originalLength = knowledge[domain].length;
-  knowledge[domain] = knowledge[domain].filter(item => item.id !== id);
-
-  if (knowledge[domain].length === originalLength) {
-    return false;
-  }
-
-  // Remove domain key if empty
-  if (knowledge[domain].length === 0) {
-    delete knowledge[domain];
-  }
-
-  await browser.storage.local.set({ [STORAGE_KEY]: knowledge });
-  console.log('[SiteKnowledge] Deleted item:', id, 'from', domain);
-
-  return true;
+  const found = await removeFromPartitions(domain, id);
+  if (found) console.log('[SiteKnowledge] Deleted item:', id, 'from', domain);
+  return found;
 }
 
 /**
@@ -360,15 +456,10 @@ async function deleteItem(domain, id) {
  */
 async function clear(domain) {
   await ensureMigrated();
+  await ensurePartitionMigrated();
 
-  const data = await browser.storage.local.get(STORAGE_KEY);
-  const knowledge = data[STORAGE_KEY] || {};
-
-  if (knowledge[domain]) {
-    delete knowledge[domain];
-    await browser.storage.local.set({ [STORAGE_KEY]: knowledge });
-    console.log('[SiteKnowledge] Cleared all items for', domain);
-  }
+  await clearDomainFromPartitions(domain);
+  console.log('[SiteKnowledge] Cleared all items for', domain);
 }
 
 // ============================================================================
@@ -383,18 +474,15 @@ async function clear(domain) {
  */
 async function getForPath(domain, path) {
   await ensureMigrated();
+  await ensurePartitionMigrated();
 
-  const data = await browser.storage.local.get(STORAGE_KEY);
-  const knowledge = data[STORAGE_KEY] || {};
-
+  const knowledge = await readAllPartitions();
   await cleanupExpired(knowledge);
 
-  // Get domain-specific items
   const domainItems = (knowledge[domain] || []).filter(item =>
     matchesPath(item.path, path)
   );
 
-  // Get global items
   let globalItems = [];
   if (domain !== '*') {
     globalItems = (knowledge['*'] || []).filter(item =>
@@ -638,7 +726,18 @@ function formatForPrompt(items, domain) {
     text += '\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\n\n';
   }
 
-  text += `## SITE SPECS — ${domain.toUpperCase()} (newest first; on conflict use newer)\n\n`;
+  // Quick-reference index — gives Claude a scannable list before reading full spec bodies
+  const allItems = profile ? [profile, ...rest] : rest;
+  const index = allItems.map(item => {
+    const typeTag = item.type ? `[${item.type}]` : '';
+    return `  ${typeTag.padEnd(12)} ${item.title}`;
+  }).join('\n');
+
+  text += `## SITE SPECS — ${domain.toUpperCase()}\n`;
+  text += `USE THESE INSTEAD OF get_accessibility_tree / find_elements / execute_script / detect_page_tech.\n`;
+  text += `If a spec covers what you need, use it directly — do not re-probe to verify it.\n\n`;
+  text += `Quick index:\n${index}\n\n`;
+  text += `Full specs (newest first; on conflict use newer):\n\n`;
 
   for (const item of rest) {
     const age = getRelativeAge(item.created);
@@ -718,20 +817,23 @@ function extractDomain(url) {
  */
 async function markUsed(domain, id, success = true) {
   await ensureMigrated();
+  await ensurePartitionMigrated();
 
-  const data = await browser.storage.local.get(STORAGE_KEY);
-  const knowledge = data[STORAGE_KEY] || {};
+  const keys = await getAllPartitionKeys();
+  if (keys.length === 0) return;
+  const data = await browser.storage.local.get(keys);
 
-  if (!knowledge[domain]) return;
-
-  const item = knowledge[domain].find(i => i.id === id);
-  if (item) {
-    item.lastUsed = Date.now();
-    item.useCount = (item.useCount || 0) + 1;
-    if (success) {
-      item.successCount = (item.successCount || 0) + 1;
+  for (const key of keys) {
+    const partition = data[key] || {};
+    if (!partition[domain]) continue;
+    const item = partition[domain].find(i => i.id === id);
+    if (item) {
+      item.lastUsed = Date.now();
+      item.useCount = (item.useCount || 0) + 1;
+      if (success) item.successCount = (item.successCount || 0) + 1;
+      await browser.storage.local.set({ [key]: partition });
+      return;
     }
-    await browser.storage.local.set({ [STORAGE_KEY]: knowledge });
   }
 }
 
@@ -753,12 +855,11 @@ function generateId() {
  * @returns {Promise<void>}
  */
 async function cleanupExpired(knowledge) {
+  // knowledge is a merged view from readAllPartitions — we don't write it back here.
+  // Expired item removal from individual partitions is handled lazily on next write.
   const now = Date.now();
-  let cleaned = false;
 
   for (const domain in knowledge) {
-    const original = knowledge[domain].length;
-
     knowledge[domain] = knowledge[domain].filter(item => {
       const expiryMs = (item.expiryDays || DEFAULT_EXPIRY_DAYS) * 24 * 60 * 60 * 1000;
       const lastUsed = item.lastUsed || item.created;
@@ -767,14 +868,7 @@ async function cleanupExpired(knowledge) {
 
     if (knowledge[domain].length === 0) {
       delete knowledge[domain];
-      cleaned = true;
-    } else if (knowledge[domain].length < original) {
-      cleaned = true;
     }
-  }
-
-  if (cleaned) {
-    await browser.storage.local.set({ [STORAGE_KEY]: knowledge });
   }
 }
 
@@ -912,7 +1006,9 @@ if (typeof window !== 'undefined') {
     setRaw,
     getRaw,
 
-    // Migration (exposed for testing/debugging)
-    _ensureMigrated: ensureMigrated
+    // Migration and maintenance (exposed for testing/debugging)
+    _ensureMigrated: ensureMigrated,
+    _ensurePartitionMigrated: ensurePartitionMigrated,
+    _cleanupOldPartitions: cleanupOldPartitions
   };
 }

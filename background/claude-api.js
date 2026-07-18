@@ -7,7 +7,9 @@
 const AVAILABLE_MODELS = {
   'claude-haiku-4-5': 'Haiku 4.5',
   'claude-sonnet-4-5': 'Sonnet 4.5',
-  'claude-opus-4-5': 'Opus 4.5'
+  'claude-opus-4-5': 'Opus 4.5',
+  'claude-sonnet-4-6': 'Sonnet 4.6',
+  'claude-opus-4-8': 'Opus 4.8'
 };
 
 // System prompt is loaded from external file by prompt-loader.js
@@ -46,10 +48,11 @@ class ClaudeAPI {
    * @param {string} model - New model ID
    */
   setModel(model) {
-    if (AVAILABLE_MODELS[model]) {
-      this.model = model;
-    } else {
-      console.warn(`Unknown model: ${model}. Available models:`, Object.keys(AVAILABLE_MODELS));
+    if (model && typeof model === 'string' && model.trim()) {
+      this.model = model.trim();
+      if (!AVAILABLE_MODELS[this.model]) {
+        console.warn(`[ClaudeAPI] Unknown model: ${model} — proceeding anyway.`);
+      }
     }
   }
 
@@ -72,10 +75,10 @@ class ClaudeAPI {
    */
   setMaxTokens(maxTokens) {
     const tokens = parseInt(maxTokens, 10);
-    if (!isNaN(tokens) && tokens >= 256 && tokens <= 8192) {
+    if (!isNaN(tokens) && tokens >= 256 && tokens <= 65536) {
       this.maxTokens = tokens;
     } else {
-      console.warn(`Invalid maxTokens: ${maxTokens}. Must be between 256 and 8192.`);
+      console.warn(`Invalid maxTokens: ${maxTokens}. Must be between 256 and 65536.`);
     }
   }
 

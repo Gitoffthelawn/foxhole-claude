@@ -13,6 +13,92 @@
   }
   window.__claude_assistant_injected = true;
 
+  // ============================================================================
+  // SPA NAVIGATION DETECTION
+  // SPAs change URLs via pushState/replaceState without a network event.
+  // Patch history methods and listen to popstate so background knows the view changed.
+  // ============================================================================
+
+  (function patchHistory() {
+    const emit = (url) => {
+      browser.runtime.sendMessage({ type: 'spa_navigation', url }).catch(() => {});
+    };
+    const _pushState = history.pushState.bind(history);
+    const _replaceState = history.replaceState.bind(history);
+    history.pushState = function(...args) {
+      _pushState(...args);
+      emit(location.href);
+    };
+    history.replaceState = function(...args) {
+      _replaceState(...args);
+      emit(location.href);
+    };
+    window.addEventListener('popstate', () => emit(location.href));
+  })();
+
+  // ============================================================================
+  // ELEMENT REGISTRY (WeakRef-based stable handles, survive SPA re-renders)
+  // ============================================================================
+
+  let _foxRefCounter = 0;
+  const _foxRefMap = new Map();
+  const _foxReverseMap = new WeakMap();
+  // Stable attrs stored at registration time for re-anchoring after SPA re-renders
+  const _foxRefMeta = new Map();
+
+  function registerElement(el) {
+    if (_foxReverseMap.has(el)) return _foxReverseMap.get(el);
+    const id = `tref_${++_foxRefCounter}`;
+    _foxRefMap.set(id, new WeakRef(el));
+    _foxReverseMap.set(el, id);
+    _foxRefMeta.set(id, {
+      tag: el.tagName.toLowerCase(),
+      id: el.id || null,
+      ariaLabel: el.getAttribute('aria-label') || null,
+      testId: el.getAttribute('data-testid') || el.getAttribute('data-test-id') || null,
+      role: el.getAttribute('role') || null,
+    });
+    return id;
+  }
+
+  // ============================================================================
+  // DEBUG LOGGING
+  // ============================================================================
+
+  let _contentDebugLogging = false;
+  const _contentDebugBuffer = [];
+  const _CONTENT_DEBUG_MAX = 500;
+  const _CONTENT_DEBUG_PERSIST = 200;
+
+  function debugLog(level, ...args) {
+    const entry = {
+      ts: Date.now(),
+      level,
+      src: 'content',
+      msg: args.map(a => (typeof a === 'object' ? JSON.stringify(a) : String(a))).join(' ')
+    };
+    if (_contentDebugLogging) {
+      _contentDebugBuffer.push(entry);
+      if (_contentDebugBuffer.length > _CONTENT_DEBUG_MAX) _contentDebugBuffer.shift();
+      browser.storage.local.set({ foxholeDebugLogs_content: _contentDebugBuffer.slice(-_CONTENT_DEBUG_PERSIST) }).catch(() => {});
+    }
+    if (level === 'ERROR') {
+      console.error('[Content]', ...args);
+    } else {
+      console.log('[Content]', ...args);
+    }
+  }
+
+  browser.storage.local.get('debugLogging').then(r => {
+    _contentDebugLogging = r.debugLogging === true;
+  }).catch(() => {});
+
+  browser.storage.onChanged.addListener((changes, area) => {
+    if (area === 'local' && changes.debugLogging !== undefined) {
+      _contentDebugLogging = changes.debugLogging.newValue === true;
+    }
+  });
+
   // Settings - default to capturing source
   let captureLogSource = true;
 
@@ -245,6 +331,9 @@
   // Allows user to click elements to mark them for later retrieval
   // ==========================================================================
 
+  // Workflow recording
+  let _recordingActive = false;
+
   let selectionModeActive = false;
   let hoveredElement = null;
   let selectedElements = new Set();
@@ -475,6 +564,78 @@
   }
 
   // ==========================================================================
+  // Element Marking
+  // ==========================================================================
+
+  function handleMarkElements(params) {
+    const { selector, filter, label, style } = params;
+    if (!selector || !label) return { error: 'selector and label are required' };
+
+    const defaultStyle = 'outline: 3px solid #FFD700; outline-offset: 2px; background-color: rgba(255, 215, 0, 0.1);';
+    const highlightStyle = style || defaultStyle;
+
+    if (!document.getElementById('claude-mark-styles')) {
+      const styleEl = document.createElement('style');
+      styleEl.id = 'claude-mark-styles';
+      styleEl.textContent = `[data-claude-marked] { ${highlightStyle} }`;
+      document.head.appendChild(styleEl);
+    }
+
+    const elements = document.querySelectorAll(selector);
+    let marked = 0;
+
+    elements.forEach((el, idx) => {
+      let shouldMark = true;
+      if (filter) {
+        try { shouldMark = (new Function('el', `return ${filter}`))(el); }
+        catch (e) { shouldMark = false; }
+      }
+      if (shouldMark) {
+        el.setAttribute('data-claude-marked', label);
+        el.setAttribute('data-claude-mark-index', marked.toString());
+        marked++;
+      }
+    });
+
+    return { marked, total: elements.length, label };
+  }
+
+  function handleGetMarkedElements(params) {
+    const { label, include_text = true } = params || {};
+    const selector = label ? `[data-claude-marked="${label}"]` : '[data-claude-marked]';
+    const elements = document.querySelectorAll(selector);
+    const byLabel = {};
+    const items = [];
+
+    elements.forEach((el, idx) => {
+      const elLabel = el.getAttribute('data-claude-marked');
+      byLabel[elLabel] = (byLabel[elLabel] || 0) + 1;
+      if (include_text) {
+        const text = (el.textContent || '').trim().slice(0, 100);
+        items.push({ index: idx, label: elLabel, tag: el.tagName.toLowerCase(), text });
+      }
+    });
+
+    return { totalMarked: elements.length, byLabel, items: include_text ? items : undefined };
+  }
+
+  function handleClearMarkedElements(params) {
+    const { label } = params || {};
+    const selector = label ? `[data-claude-marked="${label}"]` : '[data-claude-marked]';
+    const elements = document.querySelectorAll(selector);
+    let cleared = 0;
+    elements.forEach(el => {
+      el.removeAttribute('data-claude-marked');
+      el.removeAttribute('data-claude-mark-index');
+      cleared++;
+    });
+    if (!label) {
+      document.getElementById('claude-mark-styles')?.remove();
+    }
+    return { cleared, label: label || 'all' };
+  }
+
+  // ==========================================================================
   // Command Handlers - Receive commands from background script
   // ==========================================================================
 
@@ -642,9 +803,22 @@
       case 'clear_user_selections':
         return clearUserSelections();
 
+      case 'mark_elements':
+        return handleMarkElements(params);
+
+      case 'get_marked_elements':
+        return handleGetMarkedElements(params);
+
+      case 'clear_marked_elements':
+        return handleClearMarkedElements(params);
+
       // Clean text (remove excessive blank lines)
       case 'clean_text':
         return handleCleanText(params);
+
+      // Region selection for screenshot
+      case 'startRegionSelection':
+        return startRegionSelection();
 
       // IndexedDB and Cache Storage
       case 'list_indexeddb':
@@ -656,8 +830,162 @@
       case 'clear_cache_storage':
         return await handleClearCacheStorage(params);
 
+      // Accessibility tree & element discovery
+      case 'get_accessibility_tree':
+        return handleGetAccessibilityTree(params);
+
+      case 'find_elements':
+        return handleFindElements(params);
+
+      // Fetch with session cookies
+      case 'fetch_with_session':
+        return await handleFetchWithSession(params);
+
+      // File upload
+      case 'upload_file':
+        return handleUploadFile(params);
+
+      // Dialog intercept
+      case 'handle_dialog':
+        return handleDialog(params);
+
+      // Workflow recording
+      case 'start_recording':
+        return startWorkflowRecording();
+
+      case 'stop_recording':
+        return stopWorkflowRecording();
+
       default:
         throw new Error(`Unknown action: ${action}`);
+    }
+  }
+
+  // ==========================================================================
+  // Region Selection for Screenshot
+  // ==========================================================================
+
+  let regionSelecting = false;
+  let regionOverlay = null;
+  let regionBox = null;
+  let regionStartX = 0;
+  let regionStartY = 0;
+
+  function startRegionSelection() {
+    if (regionSelecting) return { error: 'Already in selection mode' };
+    regionSelecting = true;
+
+    // Inject overlay styles
+    const styleEl = document.createElement('style');
+    styleEl.id = 'foxhole-region-styles';
+    styleEl.textContent = `
+      #foxhole-region-overlay {
+        position: fixed; top: 0; left: 0; width: 100%; height: 100%; z-index: 2147483647;
+        cursor: crosshair; background: rgba(0,0,0,0.15);
+      }
+      #foxhole-region-box {
+        position: fixed; border: 2px solid #C4A052; background: rgba(196,160,82,0.1);
+        pointer-events: none; z-index: 2147483647; display: none;
+      }
+      #foxhole-region-instructions {
+        position: fixed; top: 12px; left: 50%; transform: translateX(-50%);
+        background: rgba(0,0,0,0.8); color: #fff; padding: 6px 14px; border-radius: 6px;
+        font-size: 13px; z-index: 2147483647; pointer-events: none; white-space: nowrap;
+      }
+    `;
+    document.head.appendChild(styleEl);
+
+    regionOverlay = document.createElement('div');
+    regionOverlay.id = 'foxhole-region-overlay';
+    document.body.appendChild(regionOverlay);
+
+    regionBox = document.createElement('div');
+    regionBox.id = 'foxhole-region-box';
+    document.body.appendChild(regionBox);
+
+    const instructions = document.createElement('div');
+    instructions.id = 'foxhole-region-instructions';
+    instructions.textContent = 'Click and drag to select a region — Press Esc to cancel';
+    document.body.appendChild(instructions);
+
+    regionOverlay.addEventListener('mousedown', onRegionMouseDown);
+    document.addEventListener('mousemove', onRegionMouseMove);
+    document.addEventListener('mouseup', onRegionMouseUp);
+    document.addEventListener('keydown', onRegionKeyDown);
+
+    return { started: true };
+  }
+
+  function cleanupRegionSelection() {
+    regionSelecting = false;
+    regionStartX = 0;
+    regionStartY = 0;
+    document.getElementById('foxhole-region-styles')?.remove();
+    document.getElementById('foxhole-region-overlay')?.remove();
+    document.getElementById('foxhole-region-box')?.remove();
+    document.getElementById('foxhole-region-instructions')?.remove();
+    regionOverlay = null;
+    regionBox = null;
+    document.removeEventListener('mousemove', onRegionMouseMove);
+    document.removeEventListener('mouseup', onRegionMouseUp);
+    document.removeEventListener('keydown', onRegionKeyDown);
+  }
+
+  function onRegionMouseDown(e) {
+    if (e.button !== 0) return;
+    e.preventDefault();
+    regionStartX = e.clientX;
+    regionStartY = e.clientY;
+    regionBox.style.display = 'block';
+    regionBox.style.left = regionStartX + 'px';
+    regionBox.style.top = regionStartY + 'px';
+    regionBox.style.width = '0px';
+    regionBox.style.height = '0px';
+  }
+
+  function onRegionMouseMove(e) {
+    if (!regionStartX && !regionStartY) return;
+    const x = Math.min(e.clientX, regionStartX);
+    const y = Math.min(e.clientY, regionStartY);
+    const w = Math.abs(e.clientX - regionStartX);
+    const h = Math.abs(e.clientY - regionStartY);
+    regionBox.style.left = x + 'px';
+    regionBox.style.top = y + 'px';
+    regionBox.style.width = w + 'px';
+    regionBox.style.height = h + 'px';
+  }
+
+  function onRegionMouseUp(e) {
+    if (e.button !== 0 || (!regionStartX && !regionStartY)) return;
+    e.preventDefault();
+    const x = Math.min(e.clientX, regionStartX);
+    const y = Math.min(e.clientY, regionStartY);
+    const w = Math.abs(e.clientX - regionStartX);
+    const h = Math.abs(e.clientY - regionStartY);
+
+    cleanupRegionSelection();
+
+    if (w < 5 || h < 5) {
+      browser.runtime.sendMessage({ type: 'regionSelected', cancelled: true }).catch(() => {});
+      return;
+    }
+
+    const dpr = window.devicePixelRatio || 1;
+    browser.runtime.sendMessage({
+      type: 'regionSelected',
+      bounds: {
+        left: Math.round(x * dpr),
+        top: Math.round(y * dpr),
+        width: Math.round(w * dpr),
+        height: Math.round(h * dpr)
+      }
+    }).catch(() => {});
+  }
+
+  function onRegionKeyDown(e) {
+    if (e.key === 'Escape') {
+      cleanupRegionSelection();
+      browser.runtime.sendMessage({ type: 'regionSelected', cancelled: true }).catch(() => {});
     }
   }
 
@@ -679,6 +1007,37 @@
   }
 
   function findElement(selector) {
+    if (typeof selector === 'string' && selector.startsWith('tref_')) {
+      const ref = _foxRefMap.get(selector);
+      if (!ref) throw new Error(`Ref not found: ${selector}`);
+      const el = ref.deref();
+      if (el && el.isConnected) return el;
+
+      // Element was disconnected (SPA re-render). Try to re-anchor by stable attrs.
+      const meta = _foxRefMeta.get(selector);
+      if (meta) {
+        let reanchored = null;
+        if (meta.testId) {
+          reanchored = document.querySelector(`[data-testid="${meta.testId}"]`) ||
+                       document.querySelector(`[data-test-id="${meta.testId}"]`);
+        }
+        if (!reanchored && meta.ariaLabel) {
+          const escaped = meta.ariaLabel.replace(/"/g, '\\"');
+          reanchored = document.querySelector(`${meta.tag}[aria-label="${escaped}"]`) ||
+                       document.querySelector(`[aria-label="${escaped}"]`);
+        }
+        if (!reanchored && meta.id) {
+          reanchored = document.getElementById(meta.id);
+        }
+        if (reanchored) {
+          _foxRefMap.set(selector, new WeakRef(reanchored));
+          _foxReverseMap.set(reanchored, selector);
+          return reanchored;
+        }
+      }
+
+      throw new Error(`Element no longer in DOM: ${selector}`);
+    }
     const element = document.querySelector(selector);
     if (!element) {
       throw new Error(`Element not found: ${selector}`);
@@ -1028,9 +1387,22 @@
   // ==========================================================================
 
   function handleClickElement(params) {
-    const { selector } = params;
+    const { selector, force } = params;
     const element = findElement(selector);
-    element.click();
+    element.scrollIntoView({ block: 'nearest' });
+
+    if (force) {
+      // Full pointer/mouse sequence for widgets that gate on pointer events
+      // (custom dropdowns, drag handles, canvas UIs). Plain .click() suffices
+      // for React onClick (delegated at root) but not for these.
+      for (const type of ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click']) {
+        element.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true, view: window }));
+      }
+      element.focus?.();
+    } else {
+      element.click();
+    }
+
     return { success: true, clicked: true, selector };
   }
 
@@ -1040,16 +1412,22 @@
 
     element.focus();
 
-    // REPLACE by default, only append if explicitly requested
-    if (append) {
-      element.value += text;
-    } else {
-      element.value = text;
+    // contentEditable elements (Draft.js, ProseMirror, Tiptap, etc.)
+    if (element.isContentEditable) {
+      if (!append) {
+        document.execCommand('selectAll', false, null);
+      }
+      document.execCommand('insertText', false, text);
+      fireChangeEvents(element);
+      return { success: true, typed: true, selector, replaced: !append };
     }
 
-    // Trigger input events
-    element.dispatchEvent(new Event('input', { bubbles: true }));
-    element.dispatchEvent(new Event('change', { bubbles: true }));
+    // Standard input/textarea — use native prototype setter so React/Vue detect the change.
+    // Setting element.value directly bypasses framework property overrides and
+    // onChange never fires.
+    const newValue = append ? (element.value + text) : text;
+    setNativeValue(element, newValue);
+    fireChangeEvents(element);
 
     return { success: true, typed: true, selector, replaced: !append };
   }
@@ -1312,6 +1690,328 @@
   }
 
   // ==========================================================================
+  // Accessibility Tree
+  // ==========================================================================
+
+  function getA11yRole(el) {
+    const explicit = el.getAttribute('role');
+    if (explicit) return explicit;
+    const map = {
+      A: 'link', BUTTON: 'button', INPUT: 'textbox', SELECT: 'combobox',
+      TEXTAREA: 'textbox', H1: 'heading', H2: 'heading', H3: 'heading',
+      H4: 'heading', H5: 'heading', H6: 'heading', IMG: 'image',
+      NAV: 'navigation', MAIN: 'main', HEADER: 'banner', FOOTER: 'contentinfo',
+      ASIDE: 'complementary', FORM: 'form', TABLE: 'table',
+      UL: 'list', OL: 'list', LI: 'listitem', ARTICLE: 'article',
+      SECTION: 'region', LABEL: 'label'
+    };
+    return map[el.tagName] || 'generic';
+  }
+
+  function getA11yLabel(el) {
+    if (el.getAttribute('aria-label')) return el.getAttribute('aria-label');
+    if (el.getAttribute('placeholder')) return el.getAttribute('placeholder');
+    if (el.getAttribute('title')) return el.getAttribute('title');
+    if (el.getAttribute('alt')) return el.getAttribute('alt');
+    if (el.id) {
+      try {
+        const lbl = document.querySelector(`label[for="${CSS.escape(el.id)}"]`);
+        if (lbl) return lbl.textContent.trim().slice(0, 80);
+      } catch (_) {}
+    }
+    const wrappingLabel = el.closest('label');
+    if (wrappingLabel) {
+      const t = [...wrappingLabel.childNodes]
+        .filter(n => n.nodeType === 3).map(n => n.textContent.trim()).filter(Boolean).join(' ');
+      if (t) return t.slice(0, 80);
+    }
+    const prev = el.previousElementSibling;
+    if (prev && prev.tagName === 'LABEL') return prev.textContent.trim().slice(0, 80);
+    const parentTd = el.parentElement;
+    if (parentTd && parentTd.tagName === 'TD') {
+      const prevTd = parentTd.previousElementSibling;
+      if (prevTd) return prevTd.textContent.trim().slice(0, 80);
+    }
+    const text = el.textContent?.trim();
+    if (text) return text.slice(0, 100);
+    return '';
+  }
+
+  function isA11yVisible(el) {
+    const s = getComputedStyle(el);
+    return s.display !== 'none' && s.visibility !== 'hidden' &&
+      s.opacity !== '0' && el.offsetWidth > 0 && el.offsetHeight > 0;
+  }
+
+  function isA11yInteractive(el) {
+    if (['A', 'BUTTON', 'INPUT', 'SELECT', 'TEXTAREA', 'DETAILS', 'SUMMARY'].includes(el.tagName)) return true;
+    if (el.getAttribute('onclick') || el.getAttribute('tabindex')) return true;
+    const r = el.getAttribute('role');
+    if (['button', 'link', 'checkbox', 'radio', 'combobox', 'menuitem', 'option', 'tab'].includes(r)) return true;
+    if (el.getAttribute('contenteditable') === 'true') return true;
+    return false;
+  }
+
+  const A11Y_SEMANTIC_TAGS = new Set(['H1','H2','H3','H4','H5','H6','NAV','MAIN','HEADER','FOOTER','SECTION','ARTICLE','ASIDE']);
+  const A11Y_SKIP_TAGS = new Set(['SCRIPT','STYLE','META','LINK','TITLE','NOSCRIPT','SVG','PATH']);
+
+  function handleGetAccessibilityTree(params) {
+    const { filter, depth = 15, charLimit, selector } = params || {};
+    const root = selector ? document.querySelector(selector) : document.body;
+    if (!root) return { error: `Root element not found: ${selector}` };
+
+    const lines = [];
+    let charCount = 0;
+
+    function traverse(el, indent) {
+      if (charLimit && charCount >= charLimit) return;
+      if (A11Y_SKIP_TAGS.has(el.tagName)) return;
+      if (el.getAttribute('aria-hidden') === 'true' && filter !== 'all') return;
+      if (!isA11yVisible(el) && filter !== 'all') return;
+
+      const interactive = isA11yInteractive(el);
+      const semantic = A11Y_SEMANTIC_TAGS.has(el.tagName);
+      const hasDirectText = el.childNodes.length === 1 && el.firstChild?.nodeType === 3 &&
+        (el.firstChild.textContent.trim().length > 0);
+
+      const include = filter === 'interactive' ? interactive
+        : filter === 'all' ? true
+        : (interactive || semantic || hasDirectText);
+
+      if (include) {
+        const role = getA11yRole(el);
+        const label = getA11yLabel(el);
+        const refId = registerElement(el);
+        const attrs = [];
+        if (el.tagName === 'A' && el.href) attrs.push(`href="${el.href.replace(location.origin, '')}"`);
+        if (el.tagName === 'INPUT') attrs.push(`type="${el.type}"`);
+        if (el.placeholder) attrs.push(`placeholder="${el.placeholder}"`);
+        if (el.value && el.tagName === 'INPUT' && el.type !== 'password') attrs.push(`value="${el.value.slice(0, 50)}"`);
+
+        const line = `${'  '.repeat(indent)}${role} "${label.slice(0, 80)}" [${refId}]${attrs.length ? ' ' + attrs.join(' ') : ''}`;
+        lines.push(line);
+        charCount += line.length;
+      }
+
+      if (indent < depth) {
+        for (const child of el.children) {
+          traverse(child, indent + (include ? 1 : 0));
+        }
+      }
+    }
+
+    traverse(root, 0);
+    return {
+      tree: lines.join('\n'),
+      elementCount: lines.length,
+      registeredRefs: _foxRefCounter,
+      viewport: { width: window.innerWidth, height: window.innerHeight }
+    };
+  }
+
+  // ==========================================================================
+  // Find Elements (natural language search)
+  // ==========================================================================
+
+  function handleFindElements(params) {
+    const { description = '', maxResults = 5, filter = 'interactive' } = params;
+    const tokens = description.toLowerCase().split(/\s+/).filter(t => t.length > 1);
+
+    const SKIP = new Set(['SCRIPT', 'STYLE', 'META', 'LINK', 'NOSCRIPT', 'HEAD', 'TITLE', 'SVG', 'PATH']);
+    const INTERACTIVE_TAGS = new Set(['A', 'BUTTON', 'INPUT', 'SELECT', 'TEXTAREA', 'DETAILS', 'SUMMARY']);
+
+    function isInteractiveEl(el) {
+      if (INTERACTIVE_TAGS.has(el.tagName)) return true;
+      const role = el.getAttribute('role');
+      if (['button', 'link', 'checkbox', 'radio', 'combobox', 'menuitem', 'option', 'tab'].includes(role)) return true;
+      if (el.getAttribute('onclick') !== null || el.getAttribute('tabindex') !== null) return true;
+      if (el.getAttribute('contenteditable') === 'true') return true;
+      return false;
+    }
+
+    function collectText(el) {
+      const parts = [];
+      ['aria-label', 'placeholder', 'title', 'alt', 'data-testid', 'name', 'id'].forEach(a => {
+        const v = el.getAttribute(a);
+        if (v) parts.push(v);
+      });
+      const wrappingLabel = el.closest('label');
+      if (wrappingLabel) {
+        const t = [...wrappingLabel.childNodes]
+          .filter(n => n.nodeType === 3).map(n => n.textContent.trim()).filter(Boolean).join(' ');
+        if (t) parts.push(t);
+      }
+      const prev = el.previousElementSibling;
+      if (prev && prev.tagName === 'LABEL') parts.push(prev.textContent.trim());
+      const txt = (el.textContent || '').trim();
+      if (txt.length <= 200) parts.push(txt);
+      parts.push(getA11yRole(el));
+      parts.push(el.tagName.toLowerCase());
+      return parts.join(' ').toLowerCase();
+    }
+
+    function scoreText(text) {
+      if (!tokens.length) return 0;
+      const hits = tokens.filter(t => text.includes(t)).length;
+      const phraseBonus = text.includes(description.toLowerCase()) ? 0.25 : 0;
+      return Math.min(1, hits / tokens.length + phraseBonus);
+    }
+
+    const candidates = [];
+    for (const el of document.querySelectorAll('*')) {
+      if (SKIP.has(el.tagName)) continue;
+      const s = getComputedStyle(el);
+      if (s.display === 'none' || s.visibility === 'hidden') continue;
+      const interactive = isInteractiveEl(el);
+      if (filter === 'interactive' && !interactive) continue;
+      const score = scoreText(collectText(el));
+      if (score > 0) candidates.push({ el, score, interactive });
+    }
+
+    candidates.sort((a, b) => {
+      if (a.interactive !== b.interactive) return b.interactive ? 1 : -1;
+      return b.score - a.score;
+    });
+
+    const matches = candidates.slice(0, maxResults).map(c => {
+      const refId = registerElement(c.el);
+      const rect = c.el.getBoundingClientRect();
+      return {
+        refId,
+        score: Math.round(c.score * 100) / 100,
+        role: getA11yRole(c.el),
+        label: getA11yLabel(c.el).slice(0, 80),
+        tag: c.el.tagName.toLowerCase(),
+        interactive: c.interactive,
+        rect: { x: rect.x, y: rect.y, width: rect.width, height: rect.height }
+      };
+    });
+
+    return { matches, description, totalCandidates: candidates.length };
+  }
+
+  // ==========================================================================
+  // Fetch With Session Cookies
+  // ==========================================================================
+
+  async function handleFetchWithSession(params) {
+    const { url, method = 'GET', headers = {}, body = null, timeout = 30000, maxBodySize = 50000 } = params;
+    const BODY_LIMIT = Math.min(maxBodySize, 200000);
+
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeout);
+
+    try {
+      const init = { method, headers, credentials: 'include', signal: controller.signal };
+      if (body !== null && method !== 'GET' && method !== 'HEAD') {
+        init.body = typeof body === 'string' ? body : JSON.stringify(body);
+      }
+      const resp = await fetch(url, init);
+      clearTimeout(timer);
+
+      const responseHeaders = {};
+      resp.headers.forEach((v, k) => { responseHeaders[k] = v; });
+      const text = await resp.text();
+      const truncated = text.length > BODY_LIMIT;
+      const sample = truncated ? text.slice(0, BODY_LIMIT) : text;
+      const contentType = resp.headers.get('content-type') || '';
+      let responseBody = sample;
+      if (contentType.includes('application/json')) {
+        try { responseBody = JSON.parse(sample); } catch (_) {}
+      }
+      return {
+        status: resp.status,
+        statusText: resp.statusText,
+        ok: resp.ok,
+        url: resp.url,
+        headers: responseHeaders,
+        body: responseBody,
+        truncated,
+        totalBodySize: text.length
+      };
+    } catch (e) {
+      clearTimeout(timer);
+      return { error: e.name === 'AbortError' ? `Request timed out after ${timeout}ms` : e.message };
+    }
+  }
+
+  // ==========================================================================
+  // File Upload
+  // ==========================================================================
+
+  function handleUploadFile(params) {
+    const { selector, filename, content, mimeType = '', encoding = 'text' } = params;
+    const el = findElement(selector);
+
+    if (el.tagName !== 'INPUT' || el.type !== 'file') {
+      throw new Error(`Element is not a file input (got <${el.tagName.toLowerCase()} type="${el.type}">): ${selector}`);
+    }
+
+    let bytes;
+    if (encoding === 'base64') {
+      const binary = atob(content);
+      bytes = new Uint8Array(binary.length);
+      for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+    } else {
+      bytes = new TextEncoder().encode(content);
+    }
+
+    const file = new File([bytes], filename, { type: mimeType || '' });
+    const dt = new DataTransfer();
+    dt.items.add(file);
+
+    try {
+      el.files = dt.files;
+    } catch (e) {
+      throw new Error(`Could not set files on input: ${e.message}`);
+    }
+
+    el.dispatchEvent(new Event('change', { bubbles: true }));
+    el.dispatchEvent(new Event('input', { bubbles: true }));
+
+    return { uploaded: true, filename: file.name, size: file.size, type: file.type };
+  }
+
+  // ==========================================================================
+  // Dialog Handling
+  // ==========================================================================
+
+  function handleDialog(params) {
+    const { accept = true, promptText = '', drain = false } = params || {};
+
+    window.__foxholeDialogLog = window.__foxholeDialogLog || [];
+
+    if (drain) {
+      const logged = window.__foxholeDialogLog.splice(0);
+      return { drained: true, dialogs: logged };
+    }
+
+    if (!window.__foxholeDialogOriginals) {
+      window.__foxholeDialogOriginals = {
+        alert: window.alert,
+        confirm: window.confirm,
+        prompt: window.prompt,
+      };
+    }
+
+    window.alert = function(msg) {
+      window.__foxholeDialogLog.push({ type: 'alert', message: String(msg ?? ''), at: Date.now() });
+    };
+    window.confirm = function(msg) {
+      window.__foxholeDialogLog.push({ type: 'confirm', message: String(msg ?? ''), result: accept, at: Date.now() });
+      return accept;
+    };
+    window.prompt = function(msg, defaultValue) {
+      const result = accept ? (promptText || defaultValue || '') : null;
+      window.__foxholeDialogLog.push({ type: 'prompt', message: String(msg ?? ''), defaultValue, result, at: Date.now() });
+      return result;
+    };
+
+    const pending = window.__foxholeDialogLog.splice(0);
+    return { installed: true, accept, promptText, pendingDialogs: pending };
+  }
+
+  // ==========================================================================
   // IndexedDB Handlers
   // ==========================================================================
 
@@ -1520,6 +2220,86 @@
   }
 
   // ==========================================================================
+  // Workflow Recording
+  // ==========================================================================
+
+  function getBestRecordingSelector(el) {
+    const testId = el.dataset.testid || el.dataset.testId;
+    if (testId) return `[data-testid="${testId}"]`;
+    const ariaLabel = el.getAttribute('aria-label');
+    if (ariaLabel) return `[aria-label="${ariaLabel.replace(/"/g, '\\"')}"]`;
+    if (el.id && /^[a-zA-Z_-]/.test(el.id)) return `#${el.id}`;
+    const role = el.getAttribute('role');
+    if (role && el.textContent?.trim()) return `[role="${role}"]`;
+    const parts = [];
+    let node = el;
+    for (let i = 0; i < 3 && node && node !== document.body; i++) {
+      let sel = node.tagName.toLowerCase();
+      const parent = node.parentElement;
+      if (parent) {
+        const siblings = Array.from(parent.children).filter(c => c.tagName === node.tagName);
+        if (siblings.length > 1) sel += `:nth-of-type(${siblings.indexOf(node) + 1})`;
+      }
+      parts.unshift(sel);
+      node = node.parentElement;
+    }
+    return parts.join(' > ');
+  }
+
+  function sendRecordingStep(step) {
+    browser.runtime.sendMessage({ type: 'RECORDING_STEP', step }).catch(() => {});
+  }
+
+  function _onRecordClick(e) {
+    const el = e.target.closest('a, button, [role="button"], input[type="submit"], input[type="button"], input[type="checkbox"], input[type="radio"], summary') || e.target;
+    if (el.tagName === 'INPUT' && /^(text|email|password|search|tel|url|number|)$/.test(el.type || '')) return;
+    if (el.tagName === 'TEXTAREA') return;
+    if (el.closest('[id^="foxhole"]')) return;
+    const selector = getBestRecordingSelector(el);
+    const label = el.textContent?.trim().replace(/\s+/g, ' ').slice(0, 50) || el.getAttribute('aria-label') || selector;
+    sendRecordingStep({ tool: 'click_element', input: { selector }, _label: `Click "${label}"` });
+  }
+
+  function _onRecordBlur(e) {
+    const el = e.target;
+    if (el.tagName === 'TEXTAREA' || (el.tagName === 'INPUT' && /^(text|email|password|search|tel|url|number|)$/.test(el.type || ''))) {
+      if (!el.value) return;
+      const selector = getBestRecordingSelector(el);
+      sendRecordingStep({
+        tool: 'type_text',
+        input: { selector, text: el.value, clearFirst: true },
+        _label: `Type "${el.value.slice(0, 40)}${el.value.length > 40 ? '...' : ''}" into ${selector}`
+      });
+    }
+  }
+
+  function _onRecordChange(e) {
+    const el = e.target;
+    if (el.tagName === 'SELECT') {
+      const selector = getBestRecordingSelector(el);
+      const optText = el.options[el.selectedIndex]?.text || el.value;
+      sendRecordingStep({ tool: 'select_option', input: { selector, value: el.value }, _label: `Select "${optText}" in ${selector}` });
+    }
+  }
+
+  function startWorkflowRecording() {
+    if (_recordingActive) return { ok: true, message: 'Already recording' };
+    _recordingActive = true;
+    document.addEventListener('click', _onRecordClick, true);
+    document.addEventListener('blur', _onRecordBlur, true);
+    document.addEventListener('change', _onRecordChange, true);
+    return { ok: true };
+  }
+
+  function stopWorkflowRecording() {
+    _recordingActive = false;
+    document.removeEventListener('click', _onRecordClick, true);
+    document.removeEventListener('blur', _onRecordBlur, true);
+    document.removeEventListener('change', _onRecordChange, true);
+    return { ok: true };
+  }
+
+  // ==========================================================================
   // Initialization
   // ==========================================================================
 
@@ -1528,5 +2308,5 @@
     // Ignore errors if background script isn't ready yet
   });
 
-  console.log('[Claude Assistant] Content script initialized');
+  debugLog('INFO', '[Claude Assistant] Content script initialized');
 })();

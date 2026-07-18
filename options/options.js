@@ -15,7 +15,9 @@
     maxTokens: 8192,
     maxToolIterations: 15,
     temperature: 0,
-    networkCaptureEnabled: false
+    networkCaptureEnabled: false,
+    passiveObserver: false,
+    debugLogging: false
   };
 
   // DOM Elements
@@ -33,6 +35,11 @@
     maxToolIterations: document.getElementById('max-tool-iterations'),
     temperature: document.getElementById('temperature'),
     networkCapture: document.getElementById('network-capture'),
+    passiveObserver: document.getElementById('passive-observer'),
+    debugLogging: document.getElementById('debug-logging'),
+    viewDebugLogs: document.getElementById('view-debug-logs'),
+    clearDebugLogs: document.getElementById('clear-debug-logs'),
+    debugLogOutput: document.getElementById('debug-log-output'),
     clearHistory: document.getElementById('clear-history'),
     saveSettings: document.getElementById('save-settings'),
     resetDefaults: document.getElementById('reset-defaults'),
@@ -66,6 +73,8 @@
         'maxToolIterations',
         'temperature',
         'networkCaptureEnabled',
+        'passiveObserver',
+        'debugLogging',
         'apiKeyStatus'
       ]);
 
@@ -105,6 +114,12 @@
       // Network Capture
       elements.networkCapture.checked = result.networkCaptureEnabled || DEFAULT_SETTINGS.networkCaptureEnabled;
 
+      // Passive Observer (default true — use !== false to treat missing as enabled)
+      elements.passiveObserver.checked = result.passiveObserver === true;
+
+      // Debug Logging
+      elements.debugLogging.checked = result.debugLogging === true;
+
     } catch (error) {
       console.error('Failed to load settings:', error);
       showSaveStatus('error', 'Failed to load settings: ' + error.message);
@@ -137,7 +152,7 @@
       // Validate max tokens
       let maxTokens = parseInt(elements.maxTokens.value, 10);
       if (isNaN(maxTokens) || maxTokens < 256) maxTokens = 256;
-      if (maxTokens > 8192) maxTokens = 8192;
+      if (maxTokens > 65536) maxTokens = 65536;
       elements.maxTokens.value = maxTokens;
 
       // Validate max tool iterations
@@ -160,7 +175,9 @@
         maxTokens: maxTokens,
         maxToolIterations: maxToolIterations,
         temperature: temperature,
-        networkCaptureEnabled: elements.networkCapture.checked
+        networkCaptureEnabled: elements.networkCapture.checked,
+        passiveObserver: elements.passiveObserver.checked,
+        debugLogging: elements.debugLogging.checked
       };
 
       await browser.storage.local.set(settings);
@@ -431,6 +448,33 @@
     // Clear conversation history
     elements.clearHistory.addEventListener('click', clearConversationHistory);
 
+    // View debug logs
+    elements.viewDebugLogs.addEventListener('click', async () => {
+      const data = await browser.storage.local.get(['foxholeDebugLogs_bg', 'foxholeDebugLogs_sidebar', 'foxholeDebugLogs_content']);
+      const logs = [
+        ...(data.foxholeDebugLogs_bg || []),
+        ...(data.foxholeDebugLogs_sidebar || []),
+        ...(data.foxholeDebugLogs_content || []),
+      ].sort((a, b) => a.ts - b.ts);
+      if (logs.length === 0) {
+        elements.debugLogOutput.textContent = '(no debug logs stored — enable Debug Logging and reload)';
+      } else {
+        elements.debugLogOutput.textContent = logs.map(e => {
+          const d = new Date(e.ts);
+          const ts = d.toISOString().replace('T', ' ').replace('Z', '');
+          return `[${ts}] [${e.level}] [${e.src || '?'}] ${e.msg}`;
+        }).join('\n');
+      }
+      elements.debugLogOutput.style.display = 'block';
+      elements.clearDebugLogs.style.display = '';
+    });
+
+    // Clear debug logs
+    elements.clearDebugLogs.addEventListener('click', async () => {
+      await browser.storage.local.remove(['foxholeDebugLogs_bg', 'foxholeDebugLogs_sidebar', 'foxholeDebugLogs_content']);
+      elements.debugLogOutput.textContent = '(cleared)';
+    });
+
     // Auto-save on Enter key in API key field
     elements.apiKey.addEventListener('keypress', (e) => {
       if (e.key === 'Enter') {
@@ -443,7 +487,7 @@
     elements.maxTokens.addEventListener('blur', () => {
       let value = parseInt(elements.maxTokens.value, 10);
       if (isNaN(value) || value < 256) value = 256;
-      if (value > 8192) value = 8192;
+      if (value > 65536) value = 65536;
       elements.maxTokens.value = value;
     });
 

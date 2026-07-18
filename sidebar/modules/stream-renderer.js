@@ -552,6 +552,27 @@ function finalizeMessage(contentElement, finalText, callbacks = {}) {
     if (activityLog) {
       textContainer.appendChild(activityLog);
     }
+
+    // Render <choices> buttons if present
+    const choicesMatch = finalText.match(/<choices>([\s\S]*?)<\/choices>/);
+    if (choicesMatch) {
+      const options = choicesMatch[1].split('|').map(s => s.trim()).filter(Boolean);
+      if (options.length > 0) {
+        const choicesDiv = document.createElement('div');
+        choicesDiv.className = 'choice-buttons';
+        for (const option of options) {
+          const btn = document.createElement('button');
+          btn.className = 'choice-btn';
+          btn.textContent = option;
+          btn.addEventListener('click', () => {
+            document.dispatchEvent(new CustomEvent('foxhole-choice-selected', { detail: { text: option } }));
+            choicesDiv.remove();
+          });
+          choicesDiv.appendChild(btn);
+        }
+        textContainer.appendChild(choicesDiv);
+      }
+    }
   }
 }
 

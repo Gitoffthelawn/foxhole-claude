@@ -284,13 +284,17 @@ const BROWSER_TOOLS = [
   // ============================================================================
   {
     name: 'click_element',
-    description: 'Click on a DOM element',
+    description: 'Click on a DOM element. Use force:true for custom widgets (div[role="button"], dropdowns, drag handles) that need a full pointer/mouse event sequence instead of a plain click.',
     input_schema: {
       type: 'object',
       properties: {
         selector: {
           type: 'string',
-          description: 'CSS selector for the element to click',
+          description: 'CSS selector or tref_N handle for the element to click',
+        },
+        force: {
+          type: 'boolean',
+          description: 'If true, dispatches full pointerdown→mousedown→pointerup→mouseup→click sequence. Use when plain click() does nothing on custom SPA widgets.',
         },
         frameId: {
           type: 'number',
@@ -535,7 +539,7 @@ const BROWSER_TOOLS = [
   // ============================================================================
   {
     name: 'create_markdown',
-    description: 'Save markdown file. STOP - only use if user said "save", "export", "report", or "download". Never use to "summarize" or "document" findings - just reply in chat instead.',
+    description: 'Save content as a markdown file to the user\'s Downloads folder. Use whenever the user asks to save, export, create, or generate a file/page/document from content. Do not use unprompted to silently log findings — reply in chat instead.',
     input_schema: {
       type: 'object',
       properties: {
@@ -553,7 +557,7 @@ const BROWSER_TOOLS = [
   },
   {
     name: 'create_html',
-    description: 'Save HTML file. STOP - only use if user explicitly said "HTML". Otherwise use create_markdown.',
+    description: 'Save content as an HTML file to the user\'s Downloads folder. Use when the user asks to create a page, or when rich formatting (tables, styled layout) is better than plain markdown. Prefer this over create_markdown when the output benefits from HTML rendering.',
     input_schema: {
       type: 'object',
       properties: {
@@ -1150,33 +1154,44 @@ Domain is auto-detected from the current tab.`,
   // ============================================================================
   {
     name: 'fetch_url',
-    description: `Fetch content from an external URL without navigating away from the current page.
+    description: `Fetch a URL from the extension background — bypasses page CSP and CORS.
 
-USE FOR:
-- Researching products/reviews on other sites while staying on current page
-- Fetching documentation or reference material
-- Checking external sources without losing current context
+TWO MODES:
 
-LIMITATIONS:
-- Returns text content only (no JS execution)
-- May not work well on JS-heavy single-page apps
-- Large pages will be truncated
+1. HTML mode (default): Fetches public pages, returns cleaned readable text via Readability. Good for documentation and reference material.
 
-Returns extracted text content from the page.`,
+2. Raw API mode (set method, headers, or body): Skips HTML parsing, returns raw JSON/text. Use this to call authenticated APIs by passing harvested auth headers (e.g., Cookie, Authorization, x-csrf-token from get_cookies/get_network_requests). This is the CSP bypass path — runs from the extension background, not the page.
+
+Example raw API call:
+  { url: "https://site.com/api/gql/Feed", method: "POST", headers: { "cookie": "session=abc; csrf=xyz", "x-csrf-token": "xyz", "content-type": "application/json" }, body: { operationName: "Feed", variables: {}, extensions: { persistedQuery: { version: 1, sha256Hash: "..." } } } }
+
+Harvest the exact headers from get_network_requests first — mirror them exactly.`,
     input_schema: {
       type: 'object',
       properties: {
         url: {
           type: 'string',
-          description: 'The URL to fetch content from',
+          description: 'The URL to fetch',
+        },
+        method: {
+          type: 'string',
+          description: 'HTTP method (GET, POST, PUT, PATCH, DELETE). Setting this enables raw API mode.',
+          enum: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE'],
+        },
+        headers: {
+          type: 'object',
+          description: 'Custom request headers as key-value pairs. Use to pass auth cookies, CSRF tokens, etc.',
+        },
+        body: {
+          description: 'Request body. Object is JSON-serialized automatically. String is sent as-is.',
         },
         selector: {
           type: 'string',
-          description: 'Optional CSS selector to extract specific content (e.g., "article", ".main-content"). If not provided, extracts main body content.',
+          description: 'HTML mode only: CSS selector to extract specific content.',
         },
         maxLength: {
           type: 'number',
-          description: 'Maximum characters to return (default: 15000)',
+          description: 'HTML mode only: maximum characters to return (default: 15000)',
         },
       },
       required: ['url'],
@@ -1328,6 +1343,178 @@ Each item includes a "parent" field with the containing element's text - use thi
   },
 
   // ============================================================================
+  // ACCESSIBILITY & ELEMENT DISCOVERY
+  // ============================================================================
+  {
+    name: 'get_accessibility_tree',
+    description: `Get a structured accessibility tree of the page. Returns interactive elements with stable tref_N handles that can be passed directly to click_element, type_text, hover_element, etc.
+
+Use this instead of get_page_content when finding interactive elements. Much cheaper than screenshots (text output only). Returns roles, labels, and bounds per element.
+
+Pass a tref_N handle as the selector in any interaction tool to target the element without re-querying the DOM.
+
+filter options:
+- "interactive" — only buttons, links, inputs, and ARIA widgets (recommended starting point)
+- "all" — every visible element
+- omit — interactive + semantic headings + elements with direct text`,
+    input_schema: {
+      type: 'object',
+      properties: {
+        filter: {
+          type: 'string',
+          enum: ['interactive', 'all'],
+          description: 'Which elements to include (default: interactive + semantic)',
+        },
+        selector: {
+          type: 'string',
+          description: 'CSS selector to scope the tree to a subtree (default: body)',
+        },
+        depth: {
+          type: 'number',
+          description: 'Maximum tree depth (default: 15)',
+        },
+        charLimit: {
+          type: 'number',
+          description: 'Stop after this many characters (useful for very large pages)',
+        },
+      },
+    },
+  },
+  {
+    name: 'find_elements',
+    description: `Find elements by natural language description. Scores all visible elements by how well their labels, aria-attributes, text content, and role match your query. Returns stable tref_N handles.
+
+Use when you know roughly what an element says or does but not its exact selector.
+
+Examples: "add to cart button", "email input", "search field", "submit", "close dialog"
+
+Returns top matches ranked by score. Pass the refId directly to click_element, type_text, etc.`,
+    input_schema: {
+      type: 'object',
+      properties: {
+        description: {
+          type: 'string',
+          description: 'Natural language description of the element to find',
+        },
+        maxResults: {
+          type: 'number',
+          description: 'Maximum number of results to return (default: 5)',
+        },
+        filter: {
+          type: 'string',
+          enum: ['interactive', 'all'],
+          description: 'Limit to interactive elements (default: interactive)',
+        },
+      },
+      required: ['description'],
+    },
+  },
+  {
+    name: 'fetch_with_session',
+    description: `Fetch a URL using the current page's cookies and session state.
+
+Unlike fetch_url (which runs from the background without auth), this runs from within the page context and includes the user's existing auth cookies, session tokens, and CSRF headers.
+
+USE FOR: Calling APIs on the same domain that require the user's auth. Discovering authenticated endpoints. Fetching data that requires session cookies.
+
+Same-origin requests: full cookie access. Cross-origin: subject to CORS rules of the target server.
+
+Returns status, headers, and response body (JSON-parsed if applicable).`,
+    input_schema: {
+      type: 'object',
+      properties: {
+        url: {
+          type: 'string',
+          description: 'URL to fetch',
+        },
+        method: {
+          type: 'string',
+          enum: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE'],
+          description: 'HTTP method (default: GET)',
+        },
+        headers: {
+          type: 'object',
+          description: 'Additional request headers',
+        },
+        body: {
+          description: 'Request body for POST/PUT/PATCH. String or object (auto-JSON-serialized).',
+        },
+        timeout: {
+          type: 'number',
+          description: 'Timeout in milliseconds (default: 30000)',
+        },
+        maxBodySize: {
+          type: 'number',
+          description: 'Maximum response body size in characters (default: 50000)',
+        },
+      },
+      required: ['url'],
+    },
+  },
+  {
+    name: 'upload_file',
+    description: `Set a file on a file input (<input type="file">) programmatically. Use to test file upload flows or attach files to forms without user interaction.
+
+Content can be plain text or base64-encoded binary.`,
+    input_schema: {
+      type: 'object',
+      properties: {
+        selector: {
+          type: 'string',
+          description: 'CSS selector or tref_N handle for the file input element',
+        },
+        filename: {
+          type: 'string',
+          description: 'Filename to use (e.g., "report.pdf", "data.csv")',
+        },
+        content: {
+          type: 'string',
+          description: 'File content — plain text or base64-encoded',
+        },
+        mimeType: {
+          type: 'string',
+          description: 'MIME type (e.g., "text/plain", "application/pdf", "image/png")',
+        },
+        encoding: {
+          type: 'string',
+          enum: ['text', 'base64'],
+          description: 'Content encoding (default: text)',
+        },
+      },
+      required: ['selector', 'filename', 'content'],
+    },
+  },
+  {
+    name: 'handle_dialog',
+    description: `Intercept browser dialogs (alert, confirm, prompt) so they don't block page execution.
+
+Call BEFORE triggering an action that would open a dialog. Subsequent alert/confirm/prompt calls will be auto-handled according to the accept parameter.
+
+accept: true → confirm returns true, prompt returns promptText or default value.
+accept: false → confirm returns false, prompt returns null.
+drain: true → return and clear accumulated dialog log (use AFTER an action to see if any dialogs fired).
+
+Restore originals: not supported — reload the page to reset dialogs.`,
+    input_schema: {
+      type: 'object',
+      properties: {
+        accept: {
+          type: 'boolean',
+          description: 'Whether to accept dialogs (default: true)',
+        },
+        promptText: {
+          type: 'string',
+          description: 'Text to return for prompt() dialogs (default: empty string)',
+        },
+        drain: {
+          type: 'boolean',
+          description: 'Return and clear dialog log without installing hooks (check what dialogs fired)',
+        },
+      },
+    },
+  },
+
+  // ============================================================================
   // DEVELOPER TOOLS
   // ============================================================================
   {
@@ -1459,6 +1646,62 @@ function isHighRiskTool(name) {
   ];
   return highRisk.includes(name);
 }
+
+// ============================================================================
+// WORKFLOW RECORDING
+// ============================================================================
+BROWSER_TOOLS.push(
+  {
+    name: 'start_recording',
+    description: 'Start recording user interactions to create a reusable workflow. Tell the user to perform the steps they want to automate, then call stop_recording when done. Recording captures clicks, text input, select changes, and page navigation.',
+    input_schema: { type: 'object', properties: {} },
+  },
+  {
+    name: 'stop_recording',
+    description: 'Stop recording user interactions and return the captured steps. Follow with save_workflow to name and persist the workflow.',
+    input_schema: { type: 'object', properties: {} },
+  },
+  {
+    name: 'save_workflow',
+    description: 'Save a recorded workflow with a name so it can be run later.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        name: { type: 'string', description: 'Short name for the workflow (used to run it later)' },
+        steps: { type: 'array', description: 'Steps array from stop_recording', items: { type: 'object' } },
+        description: { type: 'string', description: 'What this workflow does (1-2 sentences)' },
+      },
+      required: ['name', 'steps'],
+    },
+  },
+  {
+    name: 'list_workflows',
+    description: 'List all saved workflows with their names, descriptions, and run counts.',
+    input_schema: { type: 'object', properties: {} },
+  },
+  {
+    name: 'run_workflow',
+    description: 'Run a saved workflow by name, replaying all captured steps.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        name: { type: 'string', description: 'Name of the workflow to run' },
+      },
+      required: ['name'],
+    },
+  },
+  {
+    name: 'delete_workflow',
+    description: 'Delete a saved workflow by name.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        name: { type: 'string', description: 'Name of the workflow to delete' },
+      },
+      required: ['name'],
+    },
+  }
+);
 
 // Export for use in other background scripts
 window.BROWSER_TOOLS = BROWSER_TOOLS;

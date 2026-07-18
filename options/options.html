@@ -310,9 +310,16 @@
       display: flex;
       align-items: center;
       justify-content: space-between;
+      gap: 16px;
+    }
+
+    .toggle-row > div {
+      flex: 1;
+      min-width: 0;
     }
 
     .toggle-switch {
+      flex-shrink: 0;
       position: relative;
       display: inline-block;
       width: 44px;
@@ -546,10 +553,12 @@
         <label class="form-label" for="default-model">Default Model</label>
         <select id="default-model" class="form-select">
           <option value="claude-haiku-4-5" selected>Claude Haiku 4.5</option>
-          <option value="claude-sonnet-4-5">Claude Sonnet 4.5 (beta)</option>
-          <option value="claude-opus-4-5">Claude Opus 4.5 (beta)</option>
+          <option value="claude-sonnet-4-5">Claude Sonnet 4.5</option>
+          <option value="claude-sonnet-4-6">Claude Sonnet 4.6</option>
+          <option value="claude-opus-4-5">Claude Opus 4.5</option>
+          <option value="claude-opus-4-8">Claude Opus 4.8</option>
         </select>
-        <p class="form-description">Haiku is recommended for browser automation. Larger models cost more per tool call with no behavioral adaptation.</p>
+        <p class="form-description">Haiku is recommended for browser automation. Larger models cost more per tool call.</p>
       </div>
     </section>
 
@@ -558,17 +567,17 @@
       <h2 class="section-title">Autonomy Settings</h2>
 
       <div class="form-group">
-        <label class="form-label" for="autonomy-mode">Default Behavior</label>
+        <label class="form-label" for="autonomy-mode">Behavior</label>
         <select id="autonomy-mode" class="form-select">
           <option value="ask">Confirm risky actions</option>
           <option value="auto">Skip all confirmations</option>
         </select>
-        <p class="form-description">Default: confirms high-risk tools before executing. Skip all: no safety prompts, Claude acts freely.</p>
+        <p class="form-description">Confirm: prompts before executing high-risk tools. Skip all: no safety prompts, Claude acts freely.</p>
       </div>
 
       <div class="form-group">
-        <label class="form-label">High-Risk Tools (require confirmation)</label>
-        <p class="form-description">These tools prompt for confirmation in the default mode. Has no effect when "Skip all confirmations" is active.</p>
+        <label class="form-label">High-Risk Tools ("Confirm" mode only)</label>
+        <p class="form-description">These tools prompt for confirmation when "Confirm risky actions" is active. Has no effect in "Skip all" mode.</p>
         <div class="checkbox-list" id="high-risk-tools">
           <div class="checkbox-item">
             <input type="checkbox" id="tool-click_element" value="click_element" checked>
@@ -630,14 +639,60 @@
       </div>
     </section>
 
+    <!-- Privacy Section -->
+    <section class="section">
+      <h2 class="section-title">Privacy</h2>
+
+      <div class="form-group">
+        <div class="toggle-row">
+          <div>
+            <label class="form-label">Passive Observer</label>
+            <p class="form-description">Collect API endpoints and DOM patterns from sites you use in the sidebar. Data stays local — only sent to Anthropic when you ask Claude about it.</p>
+          </div>
+          <label class="toggle-switch">
+            <input type="checkbox" id="passive-observer">
+            <span class="toggle-slider"></span>
+          </label>
+        </div>
+      </div>
+    </section>
+
+    <!-- Debug Section -->
+    <section class="section">
+      <h2 class="section-title">Debug</h2>
+
+      <div class="form-group">
+        <div class="toggle-row">
+          <div>
+            <label class="form-label">Debug Logging</label>
+            <p class="form-description">Buffer log output from background, content, and sidebar scripts to browser.storage.local (last 200 entries). Off by default.</p>
+          </div>
+          <label class="toggle-switch">
+            <input type="checkbox" id="debug-logging">
+            <span class="toggle-slider"></span>
+          </label>
+        </div>
+      </div>
+
+      <div class="form-group">
+        <label class="form-label">Debug Log Viewer</label>
+        <p class="form-description">Shows the last 200 buffered log entries from all extension contexts.</p>
+        <div class="btn-row">
+          <button type="button" id="view-debug-logs" class="btn btn-secondary">View Debug Logs</button>
+          <button type="button" id="clear-debug-logs" class="btn btn-danger" style="display:none;">Clear Logs</button>
+        </div>
+        <pre id="debug-log-output" style="display:none;margin-top:12px;background:var(--input-bg);border:1px solid var(--border-color);border-radius:8px;padding:12px;font-size:11px;font-family:'SF Mono',Monaco,'Courier New',monospace;color:var(--text-secondary);max-height:400px;overflow:auto;white-space:pre-wrap;word-break:break-all;"></pre>
+      </div>
+    </section>
+
     <!-- Advanced Settings Section -->
     <section class="section">
       <h2 class="section-title">Advanced Settings</h2>
 
       <div class="form-group">
         <label class="form-label" for="max-tokens">Max Tokens</label>
-        <input type="number" id="max-tokens" class="form-input" min="256" max="8192" step="256" value="8192">
-        <p class="form-description">Maximum tokens for API responses (256-8192)</p>
+        <input type="number" id="max-tokens" class="form-input" min="256" max="65536" step="256" value="8192">
+        <p class="form-description">Maximum tokens for API responses (256-65536). Claude 4 models support up to 32k-64k output tokens.</p>
       </div>
 
       <div class="form-group">
@@ -686,10 +741,20 @@
 
     <!-- Footer -->
     <footer class="footer">
-      <p>Foxhole for Claude v1.0.0</p>
+      <p>Foxhole for Claude v1.0.0 &mdash;
+        <a href="https://github.com/DrBenedictPorkins/foxhole-claude" target="_blank" rel="noopener">
+          GitHub
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:11px;height:11px;vertical-align:middle;">
+            <path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/>
+            <polyline points="15 3 21 3 21 9"/>
+            <line x1="10" y1="14" x2="21" y2="3"/>
+          </svg>
+        </a>
+      </p>
     </footer>
   </div>
 
+  <script src="../sidebar/lib/browser-polyfill.min.js"></script>
   <script src="options.js"></script>
 </body>
 </html>

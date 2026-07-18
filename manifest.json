@@ -1,20 +1,21 @@
 {
   "manifest_version": 2,
   "name": "Foxhole for Claude",
-  "version": "1.15.0",
+  "version": "1.16.0",
   "description": "Chat with Claude to control your Firefox browser",
-
   "browser_specific_settings": {
     "gecko": {
       "id": "foxhole-claude@dr.benedict.porkins",
       "strict_min_version": "91.0",
       "data_collection_permissions": {
-        "required": ["websiteContent", "browsingActivity"],
+        "required": [
+          "websiteContent",
+          "browsingActivity"
+        ],
         "optional": []
       }
     }
   },
-
   "permissions": [
     "tabs",
     "activeTab",
@@ -34,7 +35,6 @@
     "bookmarks",
     "browsingData"
   ],
-
   "sidebar_action": {
     "default_title": "Foxhole for Claude",
     "default_panel": "sidebar/sidebar.html",
@@ -43,7 +43,6 @@
       "48": "icons/icon-48.png"
     }
   },
-
   "browser_action": {
     "default_title": "Open Foxhole for Claude",
     "default_icon": {
@@ -51,11 +50,11 @@
       "48": "icons/icon-48.png"
     }
   },
-
   "background": {
     "scripts": [
       "background/prompt-loader.js",
       "background/content-sanitizer.js",
+      "background/Readability.js",
       "background/tools.js",
       "background/claude-api.js",
       "background/tool-router.js",
@@ -66,27 +65,27 @@
     ],
     "persistent": true
   },
-
   "content_scripts": [
     {
-      "matches": ["<all_urls>"],
-      "js": ["content/content.js"],
+      "matches": [
+        "<all_urls>"
+      ],
+      "js": [
+        "content/content.js"
+      ],
       "run_at": "document_start",
       "all_frames": true
     }
   ],
-
   "options_ui": {
     "page": "options/options.html",
     "browser_style": true
   },
-
   "icons": {
     "16": "icons/icon-16.png",
     "48": "icons/icon-48.png",
     "128": "icons/icon-128.png"
   },
-
   "commands": {
     "clean-text": {
       "suggested_key": {
@@ -96,6 +95,5 @@
       "description": "Clean excessive blank lines in focused text field"
     }
   },
-
   "content_security_policy": "script-src 'self' 'unsafe-eval'; object-src 'self'"
 }

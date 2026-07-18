@@ -9,9 +9,12 @@
 
 const ContextManager = (function() {
   // Configuration
+  // TOKEN_THRESHOLD compares against CUMULATIVE API-reported input_tokens (includes
+  // system prompt on every turn, ~15-20k/turn). Set high enough that it only fires
+  // when the conversation itself is genuinely large, not on every turn.
   const CONFIG = {
-    MAX_MESSAGE_PAIRS: 10,           // Hard limit on conversation length
-    TOKEN_THRESHOLD: 25000,          // Trigger compression at 25k tokens
+    MAX_MESSAGE_PAIRS: 20,           // Hard limit on conversation length
+    TOKEN_THRESHOLD: 120000,         // Trigger at 120k cumulative input tokens (~6-8 real turns)
     KEEP_RECENT_PAIRS: 4,            // Keep last 4 exchanges intact
     SUMMARY_TRIGGER_PAIRS: 6,        // Start summarizing after 6 pairs
   };
